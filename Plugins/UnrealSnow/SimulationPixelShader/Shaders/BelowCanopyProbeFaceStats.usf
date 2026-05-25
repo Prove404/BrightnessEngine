@@ -1,0 +1,65 @@
+// BelowCanopyProbeFaceStats.usf
+//
+// Pass 1 of the single-capture HPEval sky-mask pipeline.
+// Reads the captured face texture, outputs per-thread-group luminance statistics
+// into OutStats: each element is float2(maxLuminance, sumPositive).
+//
+// Pass 2 (BelowCanopyProbeThreshold.usf) reduces OutStats into a single threshold float:
+//   threshold = globalMax * SkyMaxFraction   (default 0.50)
+// Sky pixels are the brightest in any scene; using the global max anchors the threshold
+// to the actual sky brightness rather than the scene mean (which terrain dominates
+// in below-canopy captures, causing mean-based thresholds to invert the mask).
+//
+// Pass 3 (IntegrateBelowCanopyProbeIrradiance.usf) uses that threshold buffer as an SRV
+// to mask sky pixels during integration — all within one RDG graph, one render target.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float4>          InputTexture;
+RWStructuredBuffer<float2> OutStats;  // float2(maxLuminance, sumPositive) per group
+
+uint2 TextureDimensions;
+uint  NumThreadGroupsX;
+
+groupshared float2 SharedStats[64];
+
+[numthreads(THREADGROUP_SIZE_X, THREADGROUP_SIZE_Y, 1)]
+void BelowCanopyProbeFaceStatsCS(
+	uint3 ThreadId      : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 GroupId       : SV_GroupID)
+{
+	const uint LocalIndex = GroupThreadId.y * THREADGROUP_SIZE_X + GroupThreadId.x;
+
+	float2 LocalStat = float2(0.0f, 0.0f);
+	if (ThreadId.x < TextureDimensions.x && ThreadId.y < TextureDimensions.y)
+	{
+		const float3 Color     = InputTexture[ThreadId.xy].rgb;
+		// Equal tristimulus weights (not BT.709 photopic) — see RGBToLuminance.usf.
+		const float  Luminance = dot(Color, float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f));
+		if (Luminance > 0.0f)
+		{
+			LocalStat = float2(Luminance, Luminance);  // x=max candidate, y=sum candidate
+		}
+	}
+
+	SharedStats[LocalIndex] = LocalStat;
+	GroupMemoryBarrierWithGroupSync();
+
+	// Parallel reduction: x = max, y = sum
+	[unroll]
+	for (uint Stride = 32; Stride > 0; Stride >>= 1)
+	{
+		if (LocalIndex < Stride)
+		{
+			SharedStats[LocalIndex].x = max(SharedStats[LocalIndex].x, SharedStats[LocalIndex + Stride].x);
+			SharedStats[LocalIndex].y += SharedStats[LocalIndex + Stride].y;
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	if (LocalIndex == 0)
+	{
+		OutStats[GroupId.y * NumThreadGroupsX + GroupId.x] = SharedStats[0];
+	}
+}

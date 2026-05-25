@@ -1,0 +1,27 @@
+// Texture Accumulator Shader
+// Adds a scaled source texture into an accumulator texture:
+//   Accumulator(x,y) = Accumulator(x,y) + Weight * Source(x,y)
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> SourceTexture;
+RWTexture2D<float> AccumulatorTexture;
+
+float Weight;
+uint2 TextureDimensions;
+
+[numthreads(8, 8, 1)]
+void TextureAccumulateCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (ThreadId.x >= TextureDimensions.x || ThreadId.y >= TextureDimensions.y)
+	{
+		return;
+	}
+
+	const float SampleValue = SourceTexture[ThreadId.xy];
+	const float AccumValue = AccumulatorTexture[ThreadId.xy];
+
+	AccumulatorTexture[ThreadId.xy] = AccumValue + SampleValue * Weight;
+}
+
+

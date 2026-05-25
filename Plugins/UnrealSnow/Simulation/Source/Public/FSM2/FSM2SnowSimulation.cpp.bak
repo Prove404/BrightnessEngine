@@ -1,0 +1,3389 @@
+#include "FSM2SnowSimulation.h"
+#include "GeoReferencingSystem.h"
+#include "SnowSimulationActor.h"
+#include "SimulationWeatherDataProviderBase.h"
+#include "Engine/World.h"
+#include "Math/UnrealMathUtility.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Misc/DateTime.h"
+#include "HAL/FileManager.h"
+
+#if WITH_EDITOR && WITH_SUNSKY_SUPPORT
+#include "EngineUtils.h"
+#include "SunPosition.h"
+#endif
+
+namespace
+{
+	constexpr float FreezePoint_K = 273.15f;
+	constexpr float KelvinEpsilon = 1e-3f;
+    constexpr float MinHeatCapacity_Jm2K = 1.0f;
+    // Use a thin numerical floor so very shallow layers (millimetre scale) are not artificially inflated.
+    constexpr float MinimumLayerThickness_m = 1.0e-4f;
+    constexpr float SaturationTolerance = 1e-6f;
+    constexpr float MinRoughnessLength_m = 1.0e-5f;
+
+    inline float StabilityPsiM(float z, float rL)
+    {
+        const float Zeta = FMath::Clamp(z * rL, -2.0f, 1.0f);
+        if (Zeta > 0.0f)
+        {
+            return -5.0f * Zeta;
+        }
+
+        const float Arg = FMath::Max(1.0f - 16.0f * Zeta, 1.0e-6f);
+        const float X = FMath::Pow(Arg, 0.25f);
+        const float HalfPi = 0.5f * PI;
+        return 2.0f * FMath::Loge((1.0f + X) * 0.5f)
+            + FMath::Loge((1.0f + X * X) * 0.5f)
+            - 2.0f * FMath::Atan(X)
+            + HalfPi;
+    }
+
+    inline float StabilityPsiH(float z, float rL)
+    {
+        const float Zeta = FMath::Clamp(z * rL, -2.0f, 1.0f);
+        if (Zeta > 0.0f)
+        {
+            return -5.0f * Zeta;
+        }
+
+        const float Arg = FMath::Max(1.0f - 16.0f * Zeta, 1.0e-6f);
+        const float X = FMath::Pow(Arg, 0.25f);
+        return 2.0f * FMath::Loge((1.0f + X * X) * 0.5f);
+    }
+}
+
+void FFSM2SnowColumn::Reset()
+{
+    LayerCount = 0;
+    for (int32 i = 0; i < GFSM2MaxLayers; ++i)
+    {
+        Thickness_m[i] = 0.0f;
+        Temperature_K[i] = FreezePoint_K;
+        IceMass_kgm2[i] = 0.0f;
+        LiquidMass_kgm2[i] = 0.0f;
+        Density_kgm3[i] = 300.0f;
+        GrainRadius_m[i] = 5.0e-5f;
+        AgeHours[i] = 0.0f;
+    }
+}
+
+void FFSM2SoilColumn::Reset()
+{
+    LayerCount = 0;
+    for (int32 i = 0; i < GFSM2MaxSoilLayers; ++i)
+    {
+        Thickness_m[i] = 0.0f;
+        Temperature_K[i] = 271.15f;
+        Moisture_VolumeFraction[i] = 0.0f;
+    }
+}
+
+void FFSM2CanopyState::Reset()
+{
+    SnowStorage_kgm2 = 0.0f;
+    LiquidStorage_kgm2 = 0.0f;
+    Temperature_K = FreezePoint_K;
+    SpecificHumidity = 0.0f;
+}
+
+void FFSM2ColumnState::Reset()
+{
+    Snow.Reset();
+    Soil.Reset();
+    Canopy.Reset();
+    Runoff_kgm2 = 0.0f;
+    SnowAlbedo = 0.0f;
+    SurfaceAlbedo = 0.0f;
+    SnowCoverFraction = 0.0f;
+    DiffuseShortwave_Wm2 = 0.0f;
+    DirectShortwave_Wm2 = 0.0f;
+}
+
+UFSM2SnowSimulation::UFSM2SnowSimulation()
+{
+    ModelParameters.Snow.FreshSnowDensity_kgm3 = 150.0f;
+
+    if (ModelParameters.Layers.SoilLayerThicknesses_m.Num() == 0)
+    {
+        ModelParameters.Layers.SoilLayerThicknesses_m = {0.1f, 0.2f, 0.4f, 0.8f};
+    }
+
+    SanitizeLayerConfiguration();
+}
+
+FString UFSM2SnowSimulation::GetSimulationName() const
+{
+	return TEXT("FSM2");
+}
+
+void UFSM2SnowSimulation::Initialize(ASnowSimulationActor* SimulationActor, const TArray<FLandscapeCell>& Cells, float InitialMaxSnow, UWorld* World)
+{
+	const int32 DimX = SimulationActor ? SimulationActor->CellsDimensionX : 0;
+	const int32 DimY = SimulationActor ? SimulationActor->CellsDimensionY : 0;
+	InitializeGrid(DimX, DimY, 1.0f);
+	EnsureStateSize(DimX * DimY);
+	ResetState();
+	SetTerrainMetadata(Cells, DimX, DimY);
+}
+
+void UFSM2SnowSimulation::Initialize_Implementation(int32 GX, int32 GY, float CellMeters)
+{
+	Super::Initialize_Implementation(GX, GY, CellMeters);
+    SanitizeLayerConfiguration();
+	EnsureStateSize(GX * GY);
+	ResetState();
+    RefreshEnvironmentalMetadata(GetWorld());
+
+    // Log parameter verification to ensure values match Fortran FSM2
+    UE_LOG(LogTemp, Warning, TEXT("=== FSM2 PARAMETER VERIFICATION ==="));
+    UE_LOG(LogTemp, Warning, TEXT("Scheme Settings:"));
+    UE_LOG(LogTemp, Warning, TEXT("  GrainGrowth: %d (0=None, 1=TempDependent, 2=TempGradient) [Fortran SGRAIN=1]"),
+        (int)ModelParameters.Snow.GrainGrowthScheme);
+    UE_LOG(LogTemp, Warning, TEXT("  AlbedoScheme: %d (0=DiagTemp, 1=PrognosticAge) [Fortran ALBEDO=2]"),
+        (int)ModelParameters.Snow.AlbedoScheme);
+    UE_LOG(LogTemp, Warning, TEXT("  DensityScheme: %d (0=Fixed, 1=Age, 2=Overburden) [Fortran DENSTY=1]"),
+        (int)ModelParameters.Snow.DensityScheme);
+    UE_LOG(LogTemp, Warning, TEXT("  HydrologyScheme: %d (0=FreeDrain, 1=Bucket, 2=Darcy) [Fortran HYDROL=1]"),
+        (int)ModelParameters.Snow.HydrologyScheme);
+    UE_LOG(LogTemp, Warning, TEXT("  ConductivityScheme: %d (0=Fixed, 1=DensityDependent) [Fortran CONDCT=1]"),
+        (int)ModelParameters.Snow.ConductivityScheme);
+
+    UE_LOG(LogTemp, Warning, TEXT("Critical Parameters:"));
+    UE_LOG(LogTemp, Warning, TEXT("  PrecipMultiplier: %.3f [Fortran default=1.0]"),
+        ModelParameters.Ensemble.PrecipitationMultiplier);
+    UE_LOG(LogTemp, Warning, TEXT("  TempOffset: %.3f K [Fortran default=0.0]"),
+        ModelParameters.Ensemble.TemperatureOffset_K);
+    UE_LOG(LogTemp, Warning, TEXT("  FreshSnowDensity: %.1f kg/m3 [Fortran rhof=100]"),
+        ModelParameters.Snow.FreshSnowDensity_kgm3);
+    UE_LOG(LogTemp, Warning, TEXT("  FreshGrainRadius: %.2e m [Fortran rgr0=5e-5]"),
+        ModelParameters.Snow.FreshSnowGrainRadius_m);
+
+    UE_LOG(LogTemp, Warning, TEXT("Albedo Parameters:"));
+    UE_LOG(LogTemp, Warning, TEXT("  MinAlbedo: %.2f [Fortran asmn=0.5]"),
+        ModelParameters.Snow.MinimumSnowAlbedo);
+    UE_LOG(LogTemp, Warning, TEXT("  MaxAlbedo: %.2f [Fortran asmx=0.85]"),
+        ModelParameters.Snow.MaximumSnowAlbedo);
+    UE_LOG(LogTemp, Warning, TEXT("  ColdTimescale: %.0f h [Fortran tcld=1000]"),
+        ModelParameters.Snow.ColdSnowAlbedoTimescale_s / 3600.0f);
+    UE_LOG(LogTemp, Warning, TEXT("  MeltTimescale: %.0f h [Fortran tmlt=100]"),
+        ModelParameters.Snow.MeltSnowAlbedoTimescale_s / 3600.0f);
+    UE_LOG(LogTemp, Warning, TEXT("  AlbedoDecayTemp: %.1f C [Fortran Talb=-2]"),
+        ModelParameters.Snow.AlbedoDecayTemperature_C);
+
+    UE_LOG(LogTemp, Warning, TEXT("Density Parameters:"));
+    UE_LOG(LogTemp, Warning, TEXT("  MaxColdDensity: %.0f kg/m3 [Fortran rcld=300]"),
+        ModelParameters.Snow.MaxColdSnowDensity_kgm3);
+    UE_LOG(LogTemp, Warning, TEXT("  MaxMeltDensity: %.0f kg/m3 [Fortran rmlt=500]"),
+        ModelParameters.Snow.MaxMeltSnowDensity_kgm3);
+    UE_LOG(LogTemp, Warning, TEXT("  CompactionTime: %.0f h [Fortran trho=200]"),
+        ModelParameters.Snow.CompactionTimescale_s / 3600.0f);
+
+    UE_LOG(LogTemp, Warning, TEXT("Terrain-Derived Controls:"));
+    UE_LOG(LogTemp, Warning, TEXT("  SlopeAdjustedSW: %d [Fortran N/A - flat terrain]"),
+        ModelParameters.Radiation.bUseSlopeAdjustedShortwave);
+
+    UE_LOG(LogTemp, Warning, TEXT("Other Key Parameters:"));
+    UE_LOG(LogTemp, Warning, TEXT("  IrreducibleWater: %.3f [Fortran Wirr=0.03]"),
+        ModelParameters.Snow.IrreducibleWaterFraction);
+    UE_LOG(LogTemp, Warning, TEXT("  ThermalMetamorphism: %.2e s^-1 [Fortran snda=2.8e-6]"),
+        ModelParameters.Snow.ThermalMetamorphismRate_s);
+    UE_LOG(LogTemp, Warning, TEXT("  SnowRoughness: %.4f m [Fortran z0sn=0.001]"),
+        ModelParameters.Snow.SnowRoughnessLength_m);
+    UE_LOG(LogTemp, Warning, TEXT("================================="));
+}
+
+void UFSM2SnowSimulation::Simulate(ASnowSimulationActor* SimulationActor, int32 CurrentSimulationStep, int32 Timesteps, bool SaveSnowMap, bool CaptureDebugInformation, TArray<FDebugCell>& DebugCells)
+{
+	if (!SimulationActor)
+	{
+		return;
+	}
+
+	UWorld* World = SimulationActor->GetWorld();
+	RefreshEnvironmentalMetadata(World);
+
+	FWeatherForcingData Forcing;
+	if (SimulationActor->WeatherProvider)
+	{
+		Forcing = SimulationActor->WeatherProvider->GetWeatherForcing(SimulationActor->CurrentSimulationTime);
+	}
+
+	Step(SimulationActor->TimeStepSeconds, Forcing, DepthMeters);
+	UploadDepthToTexture();
+}
+
+void UFSM2SnowSimulation::Step(float DtSeconds, const FWeatherForcingData& Forcing, TArray<float>& OutDepthMeters)
+{
+    if (DtSeconds <= 0.0f || OutDepthMeters.Num() == 0)
+    {
+        return;
+    }
+
+    // Log parameters once at first step
+    static bool bParametersLogged = false;
+    if (!bParametersLogged)
+    {
+        bParametersLogged = true;
+        UE_LOG(LogTemp, Warning, TEXT(""));
+        UE_LOG(LogTemp, Warning, TEXT("=== FSM2 PARAMETER VERIFICATION ==="));
+        UE_LOG(LogTemp, Warning, TEXT("Scheme Settings:"));
+        UE_LOG(LogTemp, Warning, TEXT("  GrainGrowth: %d (0=None, 1=TempDependent, 2=TempGradient) [Fortran SGRAIN=1]"),
+            (int)ModelParameters.Snow.GrainGrowthScheme);
+        UE_LOG(LogTemp, Warning, TEXT("  AlbedoScheme: %d (0=DiagTemp, 1=PrognosticAge) [Fortran ALBEDO=2]"),
+            (int)ModelParameters.Snow.AlbedoScheme);
+        UE_LOG(LogTemp, Warning, TEXT("  DensityScheme: %d (0=Fixed, 1=Age, 2=Overburden) [Fortran DENSTY=1]"),
+            (int)ModelParameters.Snow.DensityScheme);
+        UE_LOG(LogTemp, Warning, TEXT("  HydrologyScheme: %d (0=FreeDrain, 1=Bucket, 2=Darcy) [Fortran HYDROL=1]"),
+            (int)ModelParameters.Snow.HydrologyScheme);
+        UE_LOG(LogTemp, Warning, TEXT("  ConductivityScheme: %d (0=Fixed, 1=DensityDependent) [Fortran CONDCT=1]"),
+            (int)ModelParameters.Snow.ConductivityScheme);
+
+        UE_LOG(LogTemp, Warning, TEXT("Critical Parameters:"));
+        UE_LOG(LogTemp, Warning, TEXT("  PrecipMultiplier: %.3f [Fortran default=1.0]"),
+            ModelParameters.Ensemble.PrecipitationMultiplier);
+        UE_LOG(LogTemp, Warning, TEXT("  TempOffset: %.3f K [Fortran default=0.0]"),
+            ModelParameters.Ensemble.TemperatureOffset_K);
+        UE_LOG(LogTemp, Warning, TEXT("  FreshSnowDensity: %.1f kg/m3 [Fortran rhof=100]"),
+            ModelParameters.Snow.FreshSnowDensity_kgm3);
+        UE_LOG(LogTemp, Warning, TEXT("  FreshGrainRadius: %.2e m [Fortran rgr0=5e-5]"),
+            ModelParameters.Snow.FreshSnowGrainRadius_m);
+
+        UE_LOG(LogTemp, Warning, TEXT("Albedo Parameters:"));
+        UE_LOG(LogTemp, Warning, TEXT("  MinAlbedo: %.2f [Fortran asmn=0.5]"),
+            ModelParameters.Snow.MinimumSnowAlbedo);
+        UE_LOG(LogTemp, Warning, TEXT("  MaxAlbedo: %.2f [Fortran asmx=0.85]"),
+            ModelParameters.Snow.MaximumSnowAlbedo);
+        UE_LOG(LogTemp, Warning, TEXT("  ColdTimescale: %.0f h [Fortran tcld=1000]"),
+            ModelParameters.Snow.ColdSnowAlbedoTimescale_s / 3600.0f);
+        UE_LOG(LogTemp, Warning, TEXT("  MeltTimescale: %.0f h [Fortran tmlt=100]"),
+            ModelParameters.Snow.MeltSnowAlbedoTimescale_s / 3600.0f);
+        UE_LOG(LogTemp, Warning, TEXT("  AlbedoDecayTemp: %.1f C [Fortran Talb=-2]"),
+            ModelParameters.Snow.AlbedoDecayTemperature_C);
+
+        UE_LOG(LogTemp, Warning, TEXT("Density Parameters:"));
+        UE_LOG(LogTemp, Warning, TEXT("  MaxColdDensity: %.0f kg/m3 [Fortran rcld=300]"),
+            ModelParameters.Snow.MaxColdSnowDensity_kgm3);
+        UE_LOG(LogTemp, Warning, TEXT("  MaxMeltDensity: %.0f kg/m3 [Fortran rmlt=500]"),
+            ModelParameters.Snow.MaxMeltSnowDensity_kgm3);
+        UE_LOG(LogTemp, Warning, TEXT("  CompactionTime: %.0f h [Fortran trho=200]"),
+            ModelParameters.Snow.CompactionTimescale_s / 3600.0f);
+
+        UE_LOG(LogTemp, Warning, TEXT("Terrain-Derived Controls:"));
+        UE_LOG(LogTemp, Warning, TEXT("  SlopeAdjustedSW: %d [Fortran N/A - flat terrain]"),
+            ModelParameters.Radiation.bUseSlopeAdjustedShortwave);
+
+        UE_LOG(LogTemp, Warning, TEXT("Other Key Parameters:"));
+        UE_LOG(LogTemp, Warning, TEXT("  IrreducibleWater: %.3f [Fortran Wirr=0.03]"),
+            ModelParameters.Snow.IrreducibleWaterFraction);
+        UE_LOG(LogTemp, Warning, TEXT("  ThermalMetamorphism: %.2e s^-1 [Fortran snda=2.8e-6]"),
+            ModelParameters.Snow.ThermalMetamorphismRate_s);
+        UE_LOG(LogTemp, Warning, TEXT("  SnowRoughness: %.4f m [Fortran z0sn=0.001]"),
+            ModelParameters.Snow.SnowRoughnessLength_m);
+        UE_LOG(LogTemp, Warning, TEXT("================================="));
+        UE_LOG(LogTemp, Warning, TEXT(""));
+    }
+
+    RefreshEnvironmentalMetadata(GetWorld());
+
+    EnsureStateSize(OutDepthMeters.Num());
+    CachedAlbedo.SetNum(OutDepthMeters.Num(), EAllowShrinking::No);
+
+    SanitizeLayerConfiguration();
+
+    const float Pressure = FMath::Max(10100.0f, ModelParameters.Atmosphere.SurfacePressure_Pa);
+	const float AirTempK = FMath::Clamp(Forcing.Temperature_K, 200.0f, 320.0f);
+    const float Wind = FMath::Max(ModelParameters.Atmosphere.MinimumWindSpeed_mps, Forcing.Wind_mps);
+	const float RH = FMath::Clamp(Forcing.RH_01, 0.0f, 1.0f);
+	const float SnowFrac = FMath::Clamp(Forcing.SnowFrac_01, 0.0f, 1.0f);
+	const float PrecipRate = FMath::Max(0.0f, Forcing.PrecipRate_kgm2s);
+
+    const float SnowInput_kgm2 = PrecipRate * SnowFrac * DtSeconds;
+    const float RainInput_kgm2 = PrecipRate * (1.0f - SnowFrac) * DtSeconds;
+
+	const float Qa = CalcSpecificHumidity(AirTempK, RH, Pressure);
+	const float AirDensity = CalcAirDensity(AirTempK, Pressure);
+    const float FreshDensity = FMath::Clamp(ModelParameters.Snow.FreshSnowDensity_kgm3, ModelParameters.Snow.MinSnowDensity_kgm3, ModelParameters.Snow.MaxSnowDensity_kgm3);
+    const float FreshGrain = FMath::Clamp(ModelParameters.Snow.FreshSnowGrainRadius_m, 1.0e-6f, 1.0e-2f);
+
+    const bool bCollectDiagnostics = ModelParameters.Diagnostics.bEnableDiagnostics && ModelParameters.Diagnostics.DiagnosticsEveryNSteps > 0;
+    TArray<FFSM2CellDiagnostics> DiagnosticsBuffer;
+    TArray<int32> ValidTrackedIndices;
+    TArray<bool> TrackedFlags;
+
+    if (bCollectDiagnostics)
+    {
+        const int32 CellCount = OutDepthMeters.Num();
+        TrackedFlags.Init(false, CellCount);
+
+        if (ModelParameters.Diagnostics.DiagnosticsTrackedCellIndices.Num() == 0)
+        {
+            if (CellCount > 0)
+            {
+                // Track first, middle, and last cells
+                const int32 FirstIndex = 0;
+                const int32 CenterY = (GridY > 0) ? (GridY / 2) : 0;
+                const int32 CenterX = (GridX > 0) ? (GridX / 2) : 0;
+                const int32 MiddleIndex = FMath::Clamp(CenterY * GridX + CenterX, 0, CellCount - 1);
+                const int32 LastIndex = CellCount - 1;
+
+                // Add the three indices to track
+                TArray<int32> DefaultIndices = {FirstIndex, MiddleIndex, LastIndex};
+                for (int32 Index : DefaultIndices)
+                {
+                    if (Index >= 0 && Index < CellCount && !TrackedFlags[Index])
+                    {
+                        TrackedFlags[Index] = true;
+                        ValidTrackedIndices.Add(Index);
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (int32 RawIndex : ModelParameters.Diagnostics.DiagnosticsTrackedCellIndices)
+            {
+                if (RawIndex >= 0 && RawIndex < CellCount && !TrackedFlags[RawIndex])
+                {
+                    TrackedFlags[RawIndex] = true;
+                    ValidTrackedIndices.Add(RawIndex);
+                }
+            }
+
+            if (ValidTrackedIndices.Num() == 0 && CellCount > 0)
+            {
+                TrackedFlags[0] = true;
+                ValidTrackedIndices.Add(0);
+            }
+        }
+
+        DiagnosticsBuffer.Reserve(FMath::Max(ValidTrackedIndices.Num(), 1));
+    }
+
+	for (int32 Index = 0; Index < OutDepthMeters.Num(); ++Index)
+	{
+        FFSM2ColumnState& Column = CellStates[Index];
+        Column.Runoff_kgm2 = 0.0f;
+
+        const float DtHours = DtSeconds / 3600.0f;
+        AgeSnowpack(Column.Snow, DtHours);
+
+        Column.SnowCoverFraction = ComputeSnowCoverFraction(Column.Snow);
+
+        float NetSurfaceFlux = 0.0f;
+        float SurfaceTemperatureK = Column.Snow.LayerCount > 0
+            ? FMath::Clamp(Column.Snow.Temperature_K[0], ModelParameters.Snow.MinSnowTemperature_K, FreezePoint_K)
+            : FMath::Max(ModelParameters.Soil.GroundTemperature_K, ModelParameters.Snow.MinSnowTemperature_K);
+        float ThroughfallSnowOut = 0.0f;
+        float ThroughfallRainOut = 0.0f;
+        FFSM2EnergyFluxes SurfaceFluxes;
+        FFSM2SurfaceUpdate SurfaceUpdate;
+        FFSM2CellDiagnostics* DiagnosticsPtr = nullptr;
+        const float InitialSurfaceIceMass = (Column.Snow.LayerCount > 0) ? Column.Snow.IceMass_kgm2[0] : 0.0f;
+
+        const bool bTrackCell = bCollectDiagnostics && TrackedFlags.IsValidIndex(Index) && TrackedFlags[Index];
+        if (bTrackCell)
+        {
+            FFSM2CellDiagnostics& NewDiag = DiagnosticsBuffer.Emplace_GetRef();
+            NewDiag.Reset();
+            NewDiag.StepIndex = SimulationStepCounter;
+            NewDiag.CellIndex = Index;
+            NewDiag.SimulationTimeSeconds = ElapsedSimulationSeconds;
+            DiagnosticsPtr = &NewDiag;
+        }
+
+        float DiffuseSW = 0.0f;
+        float DirectSW = 0.0f;
+        PartitionShortwave(Forcing, Forcing.SWdown_Wm2, DiffuseSW, DirectSW);
+        const float SlopeAttenuation = ModelParameters.Radiation.bUseSlopeAdjustedShortwave ? ComputeSlopeAttenuation(Index) : 1.0f;
+        DiffuseSW *= SlopeAttenuation;
+        DirectSW *= SlopeAttenuation;
+        Column.DiffuseShortwave_Wm2 = DiffuseSW;
+        Column.DirectShortwave_Wm2 = DirectSW;
+
+        float WindHeight = ModelParameters.Atmosphere.WindMeasurementHeight_m;
+        float TempHeight = ModelParameters.Atmosphere.TemperatureMeasurementHeight_m;
+        AdjustMeasurementHeights(WindHeight, TempHeight);
+        const float BulkTransferCoefficient = ResolveBulkTransferCoefficient(WindHeight, TempHeight);
+
+        Column.SnowAlbedo = UpdateSnowAlbedo(Column, DtSeconds, SurfaceTemperatureK, (DtSeconds > KINDA_SMALL_NUMBER) ? SnowInput_kgm2 / DtSeconds : 0.0f);
+        Column.SurfaceAlbedo = ComputeSurfaceAlbedo(Column, Column.SnowAlbedo, Column.SnowCoverFraction);
+
+        EnergyBalanceStage(Index, Column, DtSeconds, Forcing, SnowInput_kgm2, RainInput_kgm2, AirDensity, AirTempK, Qa, Pressure, Wind, FreshDensity, FreshGrain, BulkTransferCoefficient, DiffuseSW, DirectSW, Column.SurfaceAlbedo, NetSurfaceFlux, SurfaceTemperatureK, ThroughfallSnowOut, ThroughfallRainOut, SurfaceFluxes, SurfaceUpdate, DiagnosticsPtr);
+
+        if (Column.Snow.LayerCount == 0)
+        {
+            ConductiveHeatExchange(Column.Snow, Column.Soil, DtSeconds, NetSurfaceFlux);
+
+            OutDepthMeters[Index] = 0.0f;
+            CachedAlbedo[Index] = Column.SurfaceAlbedo;
+            const float BareSurfaceTemperatureK = (Column.Soil.LayerCount > 0)
+                ? Column.Soil.Temperature_K[0]
+                : ModelParameters.Soil.GroundTemperature_K;
+            SurfaceUpdate.TemperatureK = BareSurfaceTemperatureK;
+            SurfaceTemperatureK = BareSurfaceTemperatureK;
+
+            if (DiagnosticsPtr)
+            {
+                DiagnosticsPtr->SnowDepth_m = 0.0f;
+                DiagnosticsPtr->SnowMass_kgm2 = 0.0f;
+                DiagnosticsPtr->Runoff_kgm2 = Column.Runoff_kgm2;
+                DiagnosticsPtr->Timestamp = Forcing.Timestamp;
+                DiagnosticsPtr->CanopySnow_kgm2 = Column.Canopy.SnowStorage_kgm2;
+                DiagnosticsPtr->CanopyLiquid_kgm2 = Column.Canopy.LiquidStorage_kgm2;
+                DiagnosticsPtr->SurfaceTemperatureK = BareSurfaceTemperatureK;
+                DiagnosticsPtr->NetSurfaceFlux_Wm2 = SurfaceFluxes.Total();
+                DiagnosticsPtr->Fluxes = SurfaceFluxes;
+                DiagnosticsPtr->MeltMass_kgm2 = SurfaceUpdate.MeltMass_kgm2;
+                DiagnosticsPtr->RefreezeMass_kgm2 = SurfaceUpdate.RefreezeMass_kgm2;
+                DiagnosticsPtr->SnowLayerCount = 0;
+                DiagnosticsPtr->SoilLayerCount = Column.Soil.LayerCount;
+                for (int32 SoilIdx = 0; SoilIdx < Column.Soil.LayerCount && SoilIdx < GFSM2MaxSoilLayers; ++SoilIdx)
+                {
+                    DiagnosticsPtr->SoilThickness_m[SoilIdx] = Column.Soil.Thickness_m[SoilIdx];
+                    DiagnosticsPtr->SoilTemperature_K[SoilIdx] = Column.Soil.Temperature_K[SoilIdx];
+                    DiagnosticsPtr->SoilMoisture_Vol[SoilIdx] = Column.Soil.Moisture_VolumeFraction[SoilIdx];
+                }
+                DiagnosticsPtr->SimulationTimeSeconds = ElapsedSimulationSeconds + DtSeconds;
+            }
+
+            continue;
+        }
+
+    const float MeltAtSurface = (Column.Snow.LayerCount > 0)
+        ? FMath::Clamp(InitialSurfaceIceMass - SurfaceUpdate.IceMass_kgm2, 0.0f, InitialSurfaceIceMass)
+        : 0.0f;
+        const float RemainingMelt = FMath::Max(0.0f, SurfaceUpdate.MeltMass_kgm2 - MeltAtSurface);
+
+        ApplyDensityEvolution(Column.Snow, DtSeconds);
+        float SublimationMass = 0.0f;
+        MeltRefreezeStage(Column.Snow, SurfaceUpdate, ThroughfallRainOut, DtSeconds, SublimationMass);
+        if (RemainingMelt > KINDA_SMALL_NUMBER && Column.Snow.LayerCount > 0)
+        {
+            ApplySurfaceMelt(Column.Snow, RemainingMelt);
+        }
+        ApplyDensityEvolution(Column.Snow, DtSeconds);
+        RebuildLayers(Column.Snow);
+        ConductiveHeatExchange(Column.Snow, Column.Soil, DtSeconds, NetSurfaceFlux);
+
+        const float IceMassBeforeHydrology = ComputeSnowIceMass(Column.Snow);
+        float HydrologyRunoff = 0.0f;
+        HydrologyStage(Column.Snow, DtSeconds, HydrologyRunoff);
+        Column.Runoff_kgm2 += HydrologyRunoff;
+        const float IceMassAfterHydrology = ComputeSnowIceMass(Column.Snow);
+        SurfaceUpdate.RefreezeMass_kgm2 = FMath::Max(0.0f, IceMassAfterHydrology - IceMassBeforeHydrology);
+
+        const float ResolvedSurfaceTemperatureK = (Column.Snow.LayerCount > 0)
+            ? Column.Snow.Temperature_K[0]
+            : ((Column.Soil.LayerCount > 0) ? Column.Soil.Temperature_K[0] : ModelParameters.Soil.GroundTemperature_K);
+        SurfaceUpdate.TemperatureK = ResolvedSurfaceTemperatureK;
+        SurfaceTemperatureK = ResolvedSurfaceTemperatureK;
+
+        UpdateGrainGrowth(Column.Snow, Column.Soil, SurfaceTemperatureK, DtSeconds);
+
+        OutDepthMeters[Index] = ComputeSnowDepthMeters(Column.Snow);
+        CachedAlbedo[Index] = Column.SurfaceAlbedo;
+
+        if (DiagnosticsPtr)
+        {
+            DiagnosticsPtr->SnowDepth_m = OutDepthMeters[Index];
+            const float SnowMass = ComputeSnowMass(Column.Snow);
+            DiagnosticsPtr->SnowMass_kgm2 = SnowMass;
+            DiagnosticsPtr->Runoff_kgm2 = Column.Runoff_kgm2;
+            DiagnosticsPtr->Timestamp = Forcing.Timestamp;
+            DiagnosticsPtr->CanopySnow_kgm2 = Column.Canopy.SnowStorage_kgm2;
+            DiagnosticsPtr->CanopyLiquid_kgm2 = Column.Canopy.LiquidStorage_kgm2;
+            DiagnosticsPtr->SurfaceTemperatureK = ResolvedSurfaceTemperatureK;
+            DiagnosticsPtr->NetSurfaceFlux_Wm2 = SurfaceFluxes.Total();
+            DiagnosticsPtr->Fluxes = SurfaceFluxes;
+            DiagnosticsPtr->MeltMass_kgm2 = SurfaceUpdate.MeltMass_kgm2;
+            DiagnosticsPtr->RefreezeMass_kgm2 = SurfaceUpdate.RefreezeMass_kgm2;
+            DiagnosticsPtr->SublimationMass_kgm2 = SublimationMass;
+            const int32 SnowLayerCount = FMath::Clamp(Column.Snow.LayerCount, 0, GFSM2MaxLayers);
+            const int32 SoilLayerCount = FMath::Clamp(Column.Soil.LayerCount, 0, GFSM2MaxSoilLayers);
+            DiagnosticsPtr->SnowLayerCount = SnowLayerCount;
+            DiagnosticsPtr->SoilLayerCount = SoilLayerCount;
+            DiagnosticsPtr->ThroughfallSnow_kgm2 = ThroughfallSnowOut;
+            DiagnosticsPtr->ThroughfallRain_kgm2 = ThroughfallRainOut;
+
+            for (int32 LayerIdx = 0; LayerIdx < SnowLayerCount; ++LayerIdx)
+            {
+                DiagnosticsPtr->SnowThickness_m[LayerIdx] = Column.Snow.Thickness_m[LayerIdx];
+                DiagnosticsPtr->SnowTemperature_K[LayerIdx] = Column.Snow.Temperature_K[LayerIdx];
+                DiagnosticsPtr->SnowIceMass_kgm2[LayerIdx] = Column.Snow.IceMass_kgm2[LayerIdx];
+                DiagnosticsPtr->SnowLiquidMass_kgm2[LayerIdx] = Column.Snow.LiquidMass_kgm2[LayerIdx];
+                DiagnosticsPtr->SnowDensity_kgm3[LayerIdx] = Column.Snow.Density_kgm3[LayerIdx];
+                DiagnosticsPtr->SnowGrainRadius_m[LayerIdx] = Column.Snow.GrainRadius_m[LayerIdx];
+            }
+            for (int32 LayerIdx = SnowLayerCount; LayerIdx < GFSM2MaxLayers; ++LayerIdx)
+            {
+                DiagnosticsPtr->SnowThickness_m[LayerIdx] = 0.0f;
+                DiagnosticsPtr->SnowTemperature_K[LayerIdx] = 0.0f;
+                DiagnosticsPtr->SnowIceMass_kgm2[LayerIdx] = 0.0f;
+                DiagnosticsPtr->SnowLiquidMass_kgm2[LayerIdx] = 0.0f;
+                DiagnosticsPtr->SnowDensity_kgm3[LayerIdx] = 0.0f;
+                DiagnosticsPtr->SnowGrainRadius_m[LayerIdx] = 0.0f;
+            }
+
+            for (int32 SoilIdx = 0; SoilIdx < SoilLayerCount; ++SoilIdx)
+            {
+                DiagnosticsPtr->SoilThickness_m[SoilIdx] = Column.Soil.Thickness_m[SoilIdx];
+                DiagnosticsPtr->SoilTemperature_K[SoilIdx] = Column.Soil.Temperature_K[SoilIdx];
+                DiagnosticsPtr->SoilMoisture_Vol[SoilIdx] = Column.Soil.Moisture_VolumeFraction[SoilIdx];
+            }
+            for (int32 SoilIdx = SoilLayerCount; SoilIdx < GFSM2MaxSoilLayers; ++SoilIdx)
+            {
+                DiagnosticsPtr->SoilThickness_m[SoilIdx] = 0.0f;
+                DiagnosticsPtr->SoilTemperature_K[SoilIdx] = 0.0f;
+                DiagnosticsPtr->SoilMoisture_Vol[SoilIdx] = 0.0f;
+            }
+
+            DiagnosticsPtr->SimulationTimeSeconds = ElapsedSimulationSeconds + DtSeconds;
+        }
+    }
+
+    if (bCollectDiagnostics && DiagnosticsBuffer.Num() > 0)
+    {
+        EnsureDiagnosticsFileInitialized();
+        if (SimulationStepCounter % FMath::Max(1, ModelParameters.Diagnostics.DiagnosticsEveryNSteps) == 0)
+        {
+            WriteDiagnostics(DiagnosticsBuffer);
+        }
+    }
+
+    ++SimulationStepCounter;
+    ElapsedSimulationSeconds += DtSeconds;
+}
+
+float UFSM2SnowSimulation::GetMaxSnow()
+{
+	float LocalMax = 0.0f;
+    for (const FFSM2ColumnState& Column : CellStates)
+	{
+        LocalMax = FMath::Max(LocalMax, ComputeSnowDepthMeters(Column.Snow));
+	}
+	return LocalMax * 1000.0f;
+}
+
+void UFSM2SnowSimulation::ResetState()
+{
+    for (FFSM2ColumnState& Column : CellStates)
+	{
+        InitializeColumnDefaults(Column);
+	}
+	CachedAlbedo.Reset();
+}
+
+void UFSM2SnowSimulation::EnsureStateSize(int32 CellCount)
+{
+	if (CellCount <= 0)
+	{
+		CellStates.Reset();
+		CachedAlbedo.Reset();
+		return;
+	}
+
+    const int32 PrevNum = CellStates.Num();
+    if (PrevNum != CellCount)
+	{
+		CellStates.SetNum(CellCount, EAllowShrinking::No);
+        for (int32 Idx = PrevNum; Idx < CellCount; ++Idx)
+		{
+            InitializeColumnDefaults(CellStates[Idx]);
+		}
+		CachedAlbedo.Reset();
+	}
+}
+
+void UFSM2SnowSimulation::SanitizeLayerConfiguration()
+{
+    ModelParameters.Layers.MaxSnowLayers = FMath::Clamp(ModelParameters.Layers.MaxSnowLayers, 1, GFSM2MaxLayers);
+    ModelParameters.Layers.MaxActiveLayers = FMath::Clamp(ModelParameters.Layers.MaxActiveLayers, 1, ModelParameters.Layers.MaxSnowLayers);
+    ModelParameters.Layers.SoilLayerCount = FMath::Clamp(ModelParameters.Layers.SoilLayerCount, 0, GFSM2MaxSoilLayers);
+
+    if (ModelParameters.Layers.MinimumSnowLayerThicknesses_m.Num() == 0)
+    {
+        ModelParameters.Layers.MinimumSnowLayerThicknesses_m = {0.1f, 0.2f, 0.4f};
+    }
+
+    ModelParameters.Layers.MaximumLayerThickness_m = FMath::Max(ModelParameters.Layers.MaximumLayerThickness_m, GetMinimumSnowLayerThickness(0));
+
+    if (ModelParameters.Layers.SoilLayerThicknesses_m.Num() < ModelParameters.Layers.SoilLayerCount)
+    {
+        ModelParameters.Layers.SoilLayerThicknesses_m.SetNum(ModelParameters.Layers.SoilLayerCount);
+    }
+}
+
+float UFSM2SnowSimulation::ComputeSlopeAttenuation(int32 CellIndex) const
+{
+	if (!ModelParameters.Radiation.bUseSlopeAdjustedShortwave || !bHasTerrainMetadata)
+	{
+		return 1.0f;
+	}
+
+	if (!TerrainSlopeDegrees.IsValidIndex(CellIndex))
+	{
+		return 1.0f;
+	}
+
+	const float SlopeDeg = TerrainSlopeDegrees[CellIndex];
+	const float CosTheta = FMath::Cos(FMath::DegreesToRadians(FMath::Clamp(SlopeDeg, 0.0f, 80.0f)));
+	return FMath::Clamp(CosTheta, 0.2f, 1.0f);
+}
+
+float UFSM2SnowSimulation::CalcSpecificHumidity(float TemperatureK, float RelativeHumidity, float PressurePa) const
+{
+    const float Ratio = ModelParameters.PhysicalConstants.WaterVapourMolecularRatio;
+	const float es = CalcSaturationVapourPressure(TemperatureK);
+	const float ea = FMath::Clamp(RelativeHumidity, 0.0f, 1.0f) * es;
+    const float Den = PressurePa - (1.0f - Ratio) * ea;
+    return (Den > 0.0f) ? Ratio * ea / Den : 0.0f;
+}
+
+float UFSM2SnowSimulation::CalcSaturationVapourPressure(float TemperatureK) const
+{
+    const float TempC = TemperatureK - ModelParameters.PhysicalConstants.MeltingPoint_K;
+    const float e0 = ModelParameters.PhysicalConstants.SaturationVapourPressure0_Pa;
+    return e0 * FMath::Exp((17.67f * TempC) / (TempC + 243.5f));
+}
+
+float UFSM2SnowSimulation::CalcAirDensity(float TemperatureK, float PressurePa) const
+{
+    return PressurePa / (ModelParameters.PhysicalConstants.GasConstantDryAir_JkgK * TemperatureK);
+}
+
+float UFSM2SnowSimulation::GetLayerMass(const FFSM2SnowColumn& Snow, int32 LayerIdx) const
+{
+    if (LayerIdx < 0 || LayerIdx >= Snow.LayerCount)
+    {
+        return 0.0f;
+    }
+    return FMath::Max(0.0f, Snow.IceMass_kgm2[LayerIdx] + Snow.LiquidMass_kgm2[LayerIdx]);
+}
+
+float UFSM2SnowSimulation::GetLayerHeatCapacity(const FFSM2SnowColumn& Snow, int32 LayerIdx) const
+{
+    if (LayerIdx < 0 || LayerIdx >= Snow.LayerCount)
+    {
+        return 0.0f;
+    }
+    return Snow.IceMass_kgm2[LayerIdx] * ModelParameters.PhysicalConstants.SpecificHeatIce_JkgK + Snow.LiquidMass_kgm2[LayerIdx] * ModelParameters.PhysicalConstants.SpecificHeatWater_JkgK;
+}
+
+float UFSM2SnowSimulation::GetLayerThermalConductivity(const FFSM2SnowColumn& Snow, int32 LayerIdx) const
+{
+    if (LayerIdx < 0 || LayerIdx >= Snow.LayerCount)
+    {
+        return ModelParameters.Snow.FixedSnowConductivity_WmK;
+    }
+
+    switch (ModelParameters.Snow.ConductivityScheme)
+    {
+    case EFSM2SnowConductivityScheme::Fixed:
+        return ModelParameters.Snow.FixedSnowConductivity_WmK;
+
+    case EFSM2SnowConductivityScheme::DensityDependent:
+    default:
+    {
+        const float Density = FMath::Clamp<float>(Snow.Density_kgm3[LayerIdx], ModelParameters.Snow.MinSnowDensity_kgm3, ModelParameters.Snow.MaxSnowDensity_kgm3);
+        const float DensityRatio = Density / ModelParameters.PhysicalConstants.DensityWater_kgm3;
+        // Use empirical power law relationship from original FSM2: k = 2.224 * (ρ/ρ_water)^1.885
+        const float ConductivityIce = ModelParameters.PhysicalConstants.ThermalConductivityIce_WmK;
+        return FMath::Clamp<float>(ConductivityIce * FMath::Pow(DensityRatio, 1.885f), ModelParameters.PhysicalConstants.ThermalConductivityAir_WmK, ConductivityIce);
+    }
+    }
+}
+
+void UFSM2SnowSimulation::UpdateLayerDiagnostics(FFSM2SnowColumn& Snow, int32 LayerIdx) const
+{
+    if (LayerIdx < 0 || LayerIdx >= GFSM2MaxLayers)
+    {
+        return;
+    }
+
+    const float Density = FMath::Clamp(Snow.Density_kgm3[LayerIdx], ModelParameters.Snow.MinSnowDensity_kgm3, ModelParameters.Snow.MaxSnowDensity_kgm3);
+    Snow.Density_kgm3[LayerIdx] = Density;
+    const float Mass = Snow.IceMass_kgm2[LayerIdx] + Snow.LiquidMass_kgm2[LayerIdx];
+    Snow.Thickness_m[LayerIdx] = (Mass > KINDA_SMALL_NUMBER && Density > 1.0f) ? Mass / Density : 0.0f;
+}
+
+void UFSM2SnowSimulation::InsertSurfaceLayer(FFSM2SnowColumn& Snow, float IceMass, float LiquidMass, float Density, float TemperatureK, float GrainRadius)
+{
+    const int32 MaxLayersAllowed = FMath::Clamp(ModelParameters.Layers.MaxActiveLayers, 1, GFSM2MaxLayers);
+
+    while (Snow.LayerCount >= MaxLayersAllowed && Snow.LayerCount >= 2)
+    {
+        const int32 MergeIndex = FMath::Max(0, Snow.LayerCount - 2);
+        MergeLayerDown(Snow, MergeIndex);
+    }
+
+    while (Snow.LayerCount >= GFSM2MaxLayers && Snow.LayerCount >= 2)
+    {
+        MergeLayerDown(Snow, Snow.LayerCount - 2);
+    }
+
+    const int32 MoveCount = FMath::Min(Snow.LayerCount, GFSM2MaxLayers - 1);
+    for (int32 MoveIdx = MoveCount - 1; MoveIdx >= 0; --MoveIdx)
+    {
+        const int32 DestIdx = MoveIdx + 1;
+        if (DestIdx < GFSM2MaxLayers)
+        {
+            Snow.Thickness_m[DestIdx] = Snow.Thickness_m[MoveIdx];
+            Snow.Temperature_K[DestIdx] = Snow.Temperature_K[MoveIdx];
+            Snow.IceMass_kgm2[DestIdx] = Snow.IceMass_kgm2[MoveIdx];
+            Snow.LiquidMass_kgm2[DestIdx] = Snow.LiquidMass_kgm2[MoveIdx];
+            Snow.Density_kgm3[DestIdx] = Snow.Density_kgm3[MoveIdx];
+            Snow.GrainRadius_m[DestIdx] = Snow.GrainRadius_m[MoveIdx];
+            Snow.AgeHours[DestIdx] = Snow.AgeHours[MoveIdx];
+        }
+    }
+
+    Snow.Thickness_m[0] = (Density > 1.0f) ? (Snow.IceMass_kgm2[0] + Snow.LiquidMass_kgm2[0]) / Density : 0.0f;
+    Snow.Temperature_K[0] = FMath::Clamp(TemperatureK, ModelParameters.Snow.MinSnowTemperature_K, FreezePoint_K);
+    Snow.IceMass_kgm2[0] = FMath::Max(0.0f, IceMass);
+    Snow.LiquidMass_kgm2[0] = FMath::Max(0.0f, LiquidMass);
+    Snow.Density_kgm3[0] = FMath::Clamp(Density, ModelParameters.Snow.MinSnowDensity_kgm3, ModelParameters.Snow.MaxSnowDensity_kgm3);
+    Snow.GrainRadius_m[0] = GrainRadius;
+    Snow.AgeHours[0] = 0.0f;
+    UpdateLayerDiagnostics(Snow, 0);
+
+    Snow.LayerCount = FMath::Min(Snow.LayerCount + 1, GFSM2MaxLayers);
+    if (Snow.LayerCount > MaxLayersAllowed)
+    {
+        MergeLayerDown(Snow, Snow.LayerCount - 2);
+    }
+}
+
+void UFSM2SnowSimulation::MergeLayerDown(FFSM2SnowColumn& Snow, int32 UpperIndex)
+{
+    if (UpperIndex < 0 || UpperIndex >= Snow.LayerCount - 1)
+    {
+        return;
+    }
+
+    const int32 LowerIndex = UpperIndex + 1;
+
+    const float UpperHeatCap = FMath::Max(GetLayerHeatCapacity(Snow, UpperIndex), MinHeatCapacity_Jm2K);
+    const float LowerHeatCap = FMath::Max(GetLayerHeatCapacity(Snow, LowerIndex), MinHeatCapacity_Jm2K);
+
+    Snow.IceMass_kgm2[LowerIndex] += Snow.IceMass_kgm2[UpperIndex];
+    Snow.LiquidMass_kgm2[LowerIndex] += Snow.LiquidMass_kgm2[UpperIndex];
+    Snow.IceMass_kgm2[LowerIndex] = FMath::Max(0.0f, Snow.IceMass_kgm2[LowerIndex]);
+    Snow.LiquidMass_kgm2[LowerIndex] = FMath::Max(0.0f, Snow.LiquidMass_kgm2[LowerIndex]);
+
+    const float UpperMass = GetLayerMass(Snow, UpperIndex);
+    const float LowerMass = GetLayerMass(Snow, LowerIndex);
+    const float TotalMass = UpperMass + LowerMass;
+    if (TotalMass > KINDA_SMALL_NUMBER)
+    {
+        Snow.GrainRadius_m[LowerIndex] = FMath::Clamp((Snow.GrainRadius_m[LowerIndex] * LowerMass + Snow.GrainRadius_m[UpperIndex] * UpperMass) / TotalMass, 1.0e-6f, 1.0e-2f);
+    }
+
+    const float TotalHeatCap = UpperHeatCap + LowerHeatCap;
+    if (TotalHeatCap > 0.0f)
+    {
+        Snow.Temperature_K[LowerIndex] = (Snow.Temperature_K[UpperIndex] * UpperHeatCap + Snow.Temperature_K[LowerIndex] * LowerHeatCap) / TotalHeatCap;
+    }
+
+    Snow.AgeHours[LowerIndex] = (Snow.AgeHours[LowerIndex] * LowerHeatCap + Snow.AgeHours[UpperIndex] * UpperHeatCap) / FMath::Max(TotalHeatCap, MinHeatCapacity_Jm2K);
+    Snow.Density_kgm3[LowerIndex] = FMath::Clamp((Snow.Density_kgm3[LowerIndex] + Snow.Density_kgm3[UpperIndex]) * 0.5f, ModelParameters.Snow.MinSnowDensity_kgm3, ModelParameters.Snow.MaxSnowDensity_kgm3);
+    UpdateLayerDiagnostics(Snow, LowerIndex);
+
+    for (int32 ShiftIdx = UpperIndex; ShiftIdx < Snow.LayerCount - 1; ++ShiftIdx)
+    {
+        Snow.Thickness_m[ShiftIdx] = Snow.Thickness_m[ShiftIdx + 1];
+        Snow.Temperature_K[ShiftIdx] = Snow.Temperature_K[ShiftIdx + 1];
+        Snow.IceMass_kgm2[ShiftIdx] = Snow.IceMass_kgm2[ShiftIdx + 1];
+        Snow.LiquidMass_kgm2[ShiftIdx] = Snow.LiquidMass_kgm2[ShiftIdx + 1];
+        Snow.Density_kgm3[ShiftIdx] = Snow.Density_kgm3[ShiftIdx + 1];
+        Snow.GrainRadius_m[ShiftIdx] = Snow.GrainRadius_m[ShiftIdx + 1];
+        Snow.AgeHours[ShiftIdx] = Snow.AgeHours[ShiftIdx + 1];
+    }
+
+    Snow.LayerCount = FMath::Max(0, Snow.LayerCount - 1);
+    if (Snow.LayerCount >= 0 && Snow.LayerCount < GFSM2MaxLayers)
+    {
+        const int32 ClearIdx = Snow.LayerCount;
+        Snow.Thickness_m[ClearIdx] = 0.0f;
+        Snow.Temperature_K[ClearIdx] = FreezePoint_K;
+        Snow.IceMass_kgm2[ClearIdx] = 0.0f;
+        Snow.LiquidMass_kgm2[ClearIdx] = 0.0f;
+        Snow.Density_kgm3[ClearIdx] = ModelParameters.Snow.MinSnowDensity_kgm3;
+        Snow.GrainRadius_m[ClearIdx] = FMath::Clamp(ModelParameters.Snow.FreshSnowGrainRadius_m, 1.0e-6f, 1.0e-2f);
+        Snow.AgeHours[ClearIdx] = 0.0f;
+    }
+}
+
+void UFSM2SnowSimulation::CullAndMergeLayers(FFSM2SnowColumn& Snow)
+{
+    for (int32 LayerIdx = Snow.LayerCount - 1; LayerIdx >= 0; --LayerIdx)
+    {
+        if (GetLayerMass(Snow, LayerIdx) < 1e-4f)
+        {
+            for (int32 ShiftIdx = LayerIdx; ShiftIdx < Snow.LayerCount - 1; ++ShiftIdx)
+            {
+                Snow.Thickness_m[ShiftIdx] = Snow.Thickness_m[ShiftIdx + 1];
+                Snow.Temperature_K[ShiftIdx] = Snow.Temperature_K[ShiftIdx + 1];
+                Snow.IceMass_kgm2[ShiftIdx] = Snow.IceMass_kgm2[ShiftIdx + 1];
+                Snow.LiquidMass_kgm2[ShiftIdx] = Snow.LiquidMass_kgm2[ShiftIdx + 1];
+                Snow.Density_kgm3[ShiftIdx] = Snow.Density_kgm3[ShiftIdx + 1];
+                Snow.GrainRadius_m[ShiftIdx] = Snow.GrainRadius_m[ShiftIdx + 1];
+                Snow.AgeHours[ShiftIdx] = Snow.AgeHours[ShiftIdx + 1];
+            }
+            Snow.LayerCount = FMath::Max(0, Snow.LayerCount - 1);
+        }
+    }
+
+    if (Snow.LayerCount <= 1)
+    {
+        return;
+    }
+
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount - 1; ++LayerIdx)
+    {
+        const float MinThickness = GetMinimumSnowLayerThickness(LayerIdx);
+        const float MaxThickness = FMath::Max(ModelParameters.Layers.MaximumLayerThickness_m, MinThickness);
+
+        if (Snow.Thickness_m[LayerIdx] < MinThickness)
+        {
+            MergeLayerDown(Snow, LayerIdx);
+            --LayerIdx;
+			continue;
+		}
+
+        if (Snow.Thickness_m[LayerIdx] > MaxThickness)
+        {
+            MergeLayerDown(Snow, LayerIdx);
+            --LayerIdx;
+        }
+    }
+
+    const int32 MaxLayersAllowed = FMath::Clamp(ModelParameters.Layers.MaxActiveLayers, 1, GFSM2MaxLayers);
+    while (Snow.LayerCount > MaxLayersAllowed)
+    {
+        MergeLayerDown(Snow, Snow.LayerCount - 2);
+    }
+}
+
+void UFSM2SnowSimulation::ApplyDensityEvolution(FFSM2SnowColumn& Snow, float DtSeconds)
+{
+    if (Snow.LayerCount == 0)
+    {
+        return;
+    }
+
+    switch (ModelParameters.Snow.DensityScheme)
+    {
+    case EFSM2DensityScheme::FixedDensity:
+    {
+        const float Target = FMath::Clamp(ModelParameters.Snow.FixedSnowDensity_kgm3, ModelParameters.Snow.MinSnowDensity_kgm3, ModelParameters.Snow.MaxSnowDensity_kgm3);
+        for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+        {
+            if (GetLayerMass(Snow, LayerIdx) < KINDA_SMALL_NUMBER)
+            {
+                continue;
+            }
+
+            Snow.Density_kgm3[LayerIdx] = Target;
+            UpdateLayerDiagnostics(Snow, LayerIdx);
+        }
+        break;
+    }
+
+    case EFSM2DensityScheme::AgeCompaction:
+    {
+        for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+        {
+            if (GetLayerMass(Snow, LayerIdx) < KINDA_SMALL_NUMBER)
+            {
+                continue;
+            }
+
+            const bool bCold = Snow.Temperature_K[LayerIdx] < FreezePoint_K - KelvinEpsilon && Snow.LiquidMass_kgm2[LayerIdx] < KINDA_SMALL_NUMBER;
+            const float TargetDensityRaw = bCold ? ModelParameters.Snow.MaxColdSnowDensity_kgm3 : ModelParameters.Snow.MaxMeltSnowDensity_kgm3;
+            const float TargetDensity = FMath::Min(TargetDensityRaw, ModelParameters.Snow.MaxSnowDensity_kgm3);
+            const float Timescale = ModelParameters.Snow.CompactionTimescale_s;
+            const float CurrentDensity = Snow.Density_kgm3[LayerIdx];
+
+            // Use exponential approach to match Fortran FSM2 implementation
+            float NewDensity = CurrentDensity;
+            if (CurrentDensity < TargetDensity)
+            {
+                NewDensity = TargetDensity + (CurrentDensity - TargetDensity) * FMath::Exp(-DtSeconds / FMath::Max(Timescale, 1.0f));
+            }
+
+            Snow.Density_kgm3[LayerIdx] = FMath::Clamp(NewDensity, ModelParameters.Snow.MinSnowDensity_kgm3, TargetDensity);
+            UpdateLayerDiagnostics(Snow, LayerIdx);
+        }
+        break;
+    }
+
+    case EFSM2DensityScheme::OverburdenCompaction:
+    {
+        float OverburdenMass = 0.0f;
+        const float Gravity = ModelParameters.PhysicalConstants.Gravity_mps2;
+        for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+        {
+            const float Mass = GetLayerMass(Snow, LayerIdx);
+            if (Mass < KINDA_SMALL_NUMBER)
+            {
+                continue;
+            }
+
+            OverburdenMass += 0.5f * Mass;
+
+            const float Thickness = FMath::Max(Snow.Thickness_m[LayerIdx], MinimumLayerThickness_m);
+            const bool bMeltingLayer = Snow.Temperature_K[LayerIdx] >= FreezePoint_K - KelvinEpsilon || Snow.LiquidMass_kgm2[LayerIdx] > KINDA_SMALL_NUMBER;
+            const float MaxStateDensity = bMeltingLayer
+                ? FMath::Min(ModelParameters.Snow.MaxMeltSnowDensity_kgm3, ModelParameters.Snow.MaxSnowDensity_kgm3)
+                : FMath::Min(ModelParameters.Snow.MaxColdSnowDensity_kgm3, ModelParameters.Snow.MaxSnowDensity_kgm3);
+            float Density = FMath::Clamp(Mass / Thickness, ModelParameters.Snow.MinSnowDensity_kgm3, MaxStateDensity);
+
+            const float TemperatureOffset = Snow.Temperature_K[LayerIdx] - FreezePoint_K;
+            const float ViscosityTerm = FMath::Max(ModelParameters.Snow.ReferenceViscosity_PaS * FMath::Exp(-TemperatureOffset / 12.4f + Density / 55.6f), 1.0f);
+            const float CompactionIncrement = (Density * Gravity * OverburdenMass * DtSeconds) / ViscosityTerm;
+            const float MetamorphismIncrement = DtSeconds * Density * ModelParameters.Snow.ThermalMetamorphismRate_s * FMath::Exp(TemperatureOffset / 23.8f - FMath::Max(Density - 150.0f, 0.0f) / 21.7f);
+            Density = FMath::Clamp(Density + CompactionIncrement + MetamorphismIncrement, ModelParameters.Snow.MinSnowDensity_kgm3, MaxStateDensity);
+
+            Snow.Density_kgm3[LayerIdx] = Density;
+            UpdateLayerDiagnostics(Snow, LayerIdx);
+
+            OverburdenMass += 0.5f * Mass;
+        }
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+void UFSM2SnowSimulation::MeltRefreezeStage(FFSM2SnowColumn& Snow, const FFSM2SurfaceUpdate& SurfaceUpdate, float ThroughfallRain_kgm2, float DtSeconds, float& OutSublimationMass_kgm2)
+{
+    OutSublimationMass_kgm2 = 0.0f;
+
+    if (Snow.LayerCount == 0)
+    {
+        return;
+    }
+
+    // Calculate sublimation mass from surface moisture flux (Fortran-style approach)
+    // SurfaceMassFlux_kgm2s is calculated in ComputeSurfaceEnergyBalance and represents
+    // the net moisture exchange (positive = condensation/frost, negative = evaporation/sublimation)
+    if (SurfaceUpdate.SurfaceMassFlux_kgm2s < 0.0f)
+    {
+        // Negative flux means moisture leaving surface (sublimation/evaporation)
+        float PotentialSublimationMass = -SurfaceUpdate.SurfaceMassFlux_kgm2s * DtSeconds;
+
+        // Limit sublimation by available snow mass (following Fortran FSM2 approach)
+        // Calculate available snow mass (considering any melt that occurred)
+        float AvailableSnowMass = ComputeSnowMass(Snow);
+
+        // Allow sublimation if there's available snow OR if surface temperature is below freezing
+        if (AvailableSnowMass > KINDA_SMALL_NUMBER || SurfaceUpdate.TemperatureK < FreezePoint_K)
+        {
+            if (AvailableSnowMass > KINDA_SMALL_NUMBER)
+            {
+                // Limit sublimation rate by available snow mass per timestep
+                float MaxSublimationRate = AvailableSnowMass / DtSeconds;
+                float ActualSublimationRate = FMath::Min(-SurfaceUpdate.SurfaceMassFlux_kgm2s, MaxSublimationRate);
+                OutSublimationMass_kgm2 = ActualSublimationRate * DtSeconds;
+            }
+            else
+            {
+                // No snow but surface is cold - allow sublimation (e.g., frost loss from other surfaces)
+                OutSublimationMass_kgm2 = PotentialSublimationMass;
+            }
+        }
+        // If no snow and surface not cold, sublimation is zero
+    }
+
+    // Apply melt and sublimation using Fortran-style approach
+    // Extract rates from surface energy balance
+    const float MeltMass_kgm2 = FMath::Max(0.0f, SurfaceUpdate.MeltMass_kgm2);
+
+    ApplySurfaceMeltFortran(Snow, MeltMass_kgm2 / DtSeconds, DtSeconds);
+    ApplySurfaceSublimationFortran(Snow, OutSublimationMass_kgm2 / DtSeconds, DtSeconds);
+
+    UpdateLayerDiagnostics(Snow, 0);
+}
+
+void UFSM2SnowSimulation::ApplySurfaceMelt(FFSM2SnowColumn& Snow, float MeltMass_kgm2)
+{
+    if (Snow.LayerCount <= 0 || MeltMass_kgm2 <= KINDA_SMALL_NUMBER)
+    {
+        return;
+    }
+
+    float RemainingMelt = MeltMass_kgm2;
+    int32 LayerIdx = 0;
+
+    while (LayerIdx < Snow.LayerCount && RemainingMelt > KINDA_SMALL_NUMBER)
+    {
+        const float LayerMass = GetLayerMass(Snow, LayerIdx);
+
+        if (LayerMass <= KINDA_SMALL_NUMBER)
+        {
+            MergeLayerDown(Snow, LayerIdx);
+            continue;
+        }
+
+        const float MeltHere = FMath::Min(LayerMass, RemainingMelt);
+        const float MeltFraction = MeltHere / LayerMass;
+
+        Snow.IceMass_kgm2[LayerIdx] = FMath::Max(0.0f, Snow.IceMass_kgm2[LayerIdx] - MeltHere);
+        Snow.LiquidMass_kgm2[LayerIdx] += MeltHere;
+        Snow.AgeHours[LayerIdx] = Snow.AgeHours[LayerIdx] * (1.0f - MeltFraction);
+        RemainingMelt -= MeltHere;
+
+        UpdateLayerDiagnostics(Snow, LayerIdx);
+
+        if (GetLayerMass(Snow, LayerIdx) <= KINDA_SMALL_NUMBER)
+        {
+            MergeLayerDown(Snow, LayerIdx);
+            continue;
+        }
+
+        ++LayerIdx;
+    }
+}
+
+// Fortran-style surface melt implementation
+void UFSM2SnowSimulation::ApplySurfaceMeltFortran(FFSM2SnowColumn& Snow, float MeltRate_kgm2s, float DtSeconds)
+{
+    if (Snow.LayerCount <= 0 || MeltRate_kgm2s <= KINDA_SMALL_NUMBER || DtSeconds <= 0.0f)
+    {
+        return;
+    }
+
+    float RemainingMelt = MeltRate_kgm2s * DtSeconds; // δI = Mδt
+
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount && RemainingMelt > KINDA_SMALL_NUMBER; ++LayerIdx)
+    {
+        const float LayerIceMass = Snow.IceMass_kgm2[LayerIdx];
+        if (LayerIceMass <= KINDA_SMALL_NUMBER)
+        {
+            continue;
+        }
+
+        const float HeatCapacity = FMath::Max(GetLayerHeatCapacity(Snow, LayerIdx), MinHeatCapacity_Jm2K);
+        const float ColdContent = HeatCapacity * (FreezePoint_K - Snow.Temperature_K[LayerIdx]);
+
+        // Convert any T > Tm excess energy into additional melt before continuing.
+        if (ColdContent < 0.0f)
+        {
+            const float AdditionalMelt = (-ColdContent) / ModelParameters.PhysicalConstants.LatentHeatFusion_Jkg;
+            RemainingMelt += AdditionalMelt;
+            Snow.Temperature_K[LayerIdx] = FreezePoint_K;
+        }
+
+        if (RemainingMelt > 0.0f)
+        {
+            if (RemainingMelt > LayerIceMass)
+            {
+                // Layer melts completely - convert all ice to liquid water, remove layer
+                RemainingMelt -= LayerIceMass;
+                Snow.Thickness_m[LayerIdx] = 0.0f;
+                Snow.LiquidMass_kgm2[LayerIdx] += LayerIceMass;
+                Snow.IceMass_kgm2[LayerIdx] = 0.0f;
+            }
+            else
+            {
+                // Layer melts partially - add melt to liquid, reduce thickness proportionally
+                Snow.Thickness_m[LayerIdx] *= (1.0f - RemainingMelt / LayerIceMass);
+                Snow.IceMass_kgm2[LayerIdx] -= RemainingMelt;
+                Snow.LiquidMass_kgm2[LayerIdx] += RemainingMelt;
+                RemainingMelt = 0.0f;
+            }
+        }
+
+        UpdateLayerDiagnostics(Snow, LayerIdx);
+    }
+}
+
+// Fortran-style surface sublimation implementation
+void UFSM2SnowSimulation::ApplySurfaceSublimationFortran(FFSM2SnowColumn& Snow, float SublimationRate_kgm2s, float DtSeconds)
+{
+    if (Snow.LayerCount <= 0 || SublimationRate_kgm2s <= KINDA_SMALL_NUMBER || DtSeconds <= 0.0f)
+    {
+        return;
+    }
+
+    float RemainingSublimation = SublimationRate_kgm2s * DtSeconds; // δI = Eδt
+
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount && RemainingSublimation > KINDA_SMALL_NUMBER; ++LayerIdx)
+    {
+        const float LayerIceMass = Snow.IceMass_kgm2[LayerIdx];
+        if (LayerIceMass <= KINDA_SMALL_NUMBER)
+        {
+            continue;
+        }
+
+        if (RemainingSublimation > LayerIceMass)
+        {
+            // Layer sublimates completely - remove layer
+            RemainingSublimation -= LayerIceMass;
+            Snow.Thickness_m[LayerIdx] = 0.0f;
+            Snow.IceMass_kgm2[LayerIdx] = 0.0f;
+        }
+        else
+        {
+            // Layer sublimates partially - reduce thickness proportionally
+            Snow.Thickness_m[LayerIdx] *= (1.0f - RemainingSublimation / LayerIceMass);
+            Snow.IceMass_kgm2[LayerIdx] -= RemainingSublimation;
+            RemainingSublimation = 0.0f;
+        }
+
+        UpdateLayerDiagnostics(Snow, LayerIdx);
+    }
+}
+
+float UFSM2SnowSimulation::GetMinimumSnowLayerThickness(int32 LayerIdx) const
+{
+    const float GlobalMinimum = FMath::Max(ModelParameters.Layers.MinimumLayerThickness_m, MinimumLayerThickness_m);
+
+    const TArray<float>& Configured = ModelParameters.Layers.MinimumSnowLayerThicknesses_m;
+    if (Configured.Num() > 0)
+    {
+        if (LayerIdx < Configured.Num())
+        {
+            return FMath::Max(Configured[LayerIdx], GlobalMinimum);
+        }
+
+        return FMath::Max(Configured.Last(), GlobalMinimum);
+    }
+
+    return GlobalMinimum;
+}
+
+void UFSM2SnowSimulation::ConductiveHeatExchange(FFSM2SnowColumn& Snow, FFSM2SoilColumn& Soil, float DtSeconds, float SurfaceFlux_Wm2)
+{
+    const int32 SnowCount = FMath::Clamp(Snow.LayerCount, 0, GFSM2MaxLayers);
+    const int32 SoilCount = FMath::Clamp(Soil.LayerCount, 0, GFSM2MaxSoilLayers);
+
+    if ((SnowCount <= 0 && SoilCount <= 0) || DtSeconds <= 0.0f)
+    {
+        return;
+    }
+
+    double Gsoil_Wm2 = SurfaceFlux_Wm2; // Default to surface flux when no snow (matches Fortran: Gsoil = Gsrf)
+    if (SnowCount > 0)
+    {
+        ComputeSnowConduction(Snow, Soil, DtSeconds, SurfaceFlux_Wm2, Gsoil_Wm2);
+    }
+
+    if (SoilCount > 0)
+    {
+        AdvanceSoilColumn(Soil, DtSeconds, Gsoil_Wm2);
+    }
+}
+
+void UFSM2SnowSimulation::HydrologyStage(FFSM2SnowColumn& Snow, float DtSeconds, float& OutRunoff_kgm2)
+{
+    OutRunoff_kgm2 = 0.0f;
+
+    switch (ModelParameters.Snow.HydrologyScheme)
+    {
+    case EFSM2HydrologyScheme::FreeDrain:
+        HydrologyFreeDrain(Snow, OutRunoff_kgm2);
+        break;
+
+    case EFSM2HydrologyScheme::Bucket:
+        HydrologyBucket(Snow, DtSeconds, OutRunoff_kgm2);
+        break;
+
+    case EFSM2HydrologyScheme::Darcy:
+        HydrologyGravitational(Snow, DtSeconds, OutRunoff_kgm2);
+        break;
+
+    default:
+        HydrologyBucket(Snow, DtSeconds, OutRunoff_kgm2);
+        break;
+    }
+}
+
+void UFSM2SnowSimulation::HydrologyFreeDrain(FFSM2SnowColumn& Snow, float& OutRunoff_kgm2)
+{
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        if (Snow.LiquidMass_kgm2[LayerIdx] <= KINDA_SMALL_NUMBER)
+        {
+            continue;
+        }
+
+        OutRunoff_kgm2 += Snow.LiquidMass_kgm2[LayerIdx];
+        Snow.LiquidMass_kgm2[LayerIdx] = 0.0f;
+        UpdateLayerDiagnostics(Snow, LayerIdx);
+    }
+}
+
+void UFSM2SnowSimulation::HydrologyBucket(FFSM2SnowColumn& Snow, float DtSeconds, float& OutRunoff_kgm2)
+{
+    if (Snow.LayerCount == 0 || DtSeconds <= 0.0f)
+    {
+        return;
+    }
+
+    // Check if there's any liquid water or rainfall to process
+    bool HasLiquid = false;
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        if (Snow.LiquidMass_kgm2[LayerIdx] > KINDA_SMALL_NUMBER)
+        {
+            HasLiquid = true;
+            break;
+        }
+    }
+
+    if (!HasLiquid)
+    {
+        return;
+    }
+
+    const float DensityWater = ModelParameters.PhysicalConstants.DensityWater_kgm3;
+    const float DensityIce = ModelParameters.PhysicalConstants.DensityIce_kgm3;
+    const float LatentHeatFusion = ModelParameters.PhysicalConstants.LatentHeatFusion_Jkg;
+    const float IrreducibleWaterFraction = FMath::Clamp(ModelParameters.Snow.IrreducibleWaterFraction, 0.0f, 0.2f);
+
+    float CurrentRunoff = 0.0f; // Runoff to pass to next layer (kg/m²)
+
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        const float Thickness = FMath::Max(Snow.Thickness_m[LayerIdx], MinimumLayerThickness_m);
+
+        // Calculate porosity
+        float Porosity = 1.0f - Snow.IceMass_kgm2[LayerIdx] / (DensityIce * Thickness);
+        Porosity = FMath::Max(0.0f, Porosity);
+
+        // Calculate maximum liquid content for this layer (porosity-based)
+        const float MaxLiquidMass = DensityWater * Thickness * Porosity * IrreducibleWaterFraction;
+
+        // Add incoming runoff to this layer
+        Snow.LiquidMass_kgm2[LayerIdx] += CurrentRunoff * DtSeconds;
+
+        // Reset runoff for next layer
+        CurrentRunoff = 0.0f;
+
+        // Check if liquid capacity is exceeded
+        if (Snow.LiquidMass_kgm2[LayerIdx] > MaxLiquidMass)
+        {
+            // Calculate drainage rate (kg/m²/s)
+            CurrentRunoff = (Snow.LiquidMass_kgm2[LayerIdx] - MaxLiquidMass) / DtSeconds;
+            // Set liquid mass to maximum capacity
+            Snow.LiquidMass_kgm2[LayerIdx] = MaxLiquidMass;
+        }
+
+        // Ensure liquid mass doesn't go negative
+        Snow.LiquidMass_kgm2[LayerIdx] = FMath::Max(0.0f, Snow.LiquidMass_kgm2[LayerIdx]);
+
+        // Calculate heat capacity
+        const float HeatCapacity = GetLayerHeatCapacity(Snow, LayerIdx);
+
+        // Check for freezing
+        const float ColdContent = HeatCapacity * FMath::Max(FreezePoint_K - Snow.Temperature_K[LayerIdx], 0.0f);
+        if (ColdContent > 0.0f && Snow.LiquidMass_kgm2[LayerIdx] > KINDA_SMALL_NUMBER)
+        {
+            // Calculate how much liquid can freeze
+            const float FreezeMass = FMath::Min(Snow.LiquidMass_kgm2[LayerIdx],
+                ColdContent / FMath::Max(LatentHeatFusion, 1.0f));
+
+            // Update masses and temperature
+            Snow.LiquidMass_kgm2[LayerIdx] -= FreezeMass;
+            Snow.IceMass_kgm2[LayerIdx] += FreezeMass;
+            Snow.Temperature_K[LayerIdx] += (LatentHeatFusion * FreezeMass) / FMath::Max(HeatCapacity, MinHeatCapacity_Jm2K);
+            Snow.Temperature_K[LayerIdx] = FMath::Clamp(Snow.Temperature_K[LayerIdx],
+                ModelParameters.Snow.MinSnowTemperature_K, FreezePoint_K);
+        }
+
+        UpdateLayerDiagnostics(Snow, LayerIdx);
+    }
+
+    // Any remaining runoff becomes total runoff
+    OutRunoff_kgm2 += CurrentRunoff * DtSeconds;
+}
+
+void UFSM2SnowSimulation::HydrologyGravitational(FFSM2SnowColumn& Snow, float DtSeconds, float& OutRunoff_kgm2)
+{
+    if (Snow.LayerCount == 0 || DtSeconds <= 0.0f)
+    {
+        return;
+    }
+
+    const int32 SubSteps = FMath::Max(1, ModelParameters.Snow.HydrologySubsteps);
+    const float SubDt = DtSeconds / SubSteps;
+    const float ResidualFrac = FMath::Clamp(ModelParameters.Snow.IrreducibleWaterFraction, 0.0f, 0.2f);
+    const float DensityWater = ModelParameters.PhysicalConstants.DensityWater_kgm3;
+    const float DensityIce = ModelParameters.PhysicalConstants.DensityIce_kgm3;
+    const float Gravity = ModelParameters.PhysicalConstants.Gravity_mps2;
+    const float Viscosity = ModelParameters.PhysicalConstants.WaterDynamicViscosity_Pas;
+
+    TStaticArray<float, GFSM2MaxLayers + 1> Qw;
+    TStaticArray<float, GFSM2MaxLayers> Phi;
+    TStaticArray<float, GFSM2MaxLayers> Theta;
+    TStaticArray<float, GFSM2MaxLayers> ThetaR;
+    TStaticArray<float, GFSM2MaxLayers> Thickness;
+    TStaticArray<float, GFSM2MaxLayers> Ksat;
+
+    for (int32 StepIdx = 0; StepIdx < SubSteps; ++StepIdx)
+    {
+        Qw[0] = 0.0f;
+        for (int32 i = 1; i < GFSM2MaxLayers + 1; ++i)
+        {
+            Qw[i] = 0.0f;
+        }
+
+        for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+        {
+            Thickness[LayerIdx] = FMath::Max(Snow.Thickness_m[LayerIdx], MinimumLayerThickness_m);
+            Phi[LayerIdx] = FMath::Clamp(1.0f - Snow.IceMass_kgm2[LayerIdx] / (DensityIce * Thickness[LayerIdx]), 0.0f, 0.95f);
+            ThetaR[LayerIdx] = ResidualFrac * Phi[LayerIdx];
+            Theta[LayerIdx] = Snow.LiquidMass_kgm2[LayerIdx] / (DensityWater * Thickness[LayerIdx]);
+            Ksat[LayerIdx] = 0.31f * (DensityWater * Gravity / Viscosity) * FMath::Square(FMath::Max(Snow.GrainRadius_m[LayerIdx], 1.0e-6f)) * FMath::Exp(-7.8f * Snow.IceMass_kgm2[LayerIdx] / (DensityWater * Thickness[LayerIdx]));
+
+            if (Theta[LayerIdx] > Phi[LayerIdx])
+            {
+                const float Excess = (Theta[LayerIdx] - Phi[LayerIdx]) * DensityWater * Thickness[LayerIdx];
+                Snow.LiquidMass_kgm2[LayerIdx] -= Excess;
+                OutRunoff_kgm2 += Excess;
+                Theta[LayerIdx] = Phi[LayerIdx];
+            }
+        }
+
+        const int32 Iterations = FMath::Max(1, ModelParameters.Snow.DarcyIterations);
+        for (int32 Iter = 0; Iter < Iterations; ++Iter)
+        {
+            for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+            {
+                if (Theta[LayerIdx] <= ThetaR[LayerIdx])
+                {
+                    Qw[LayerIdx + 1] = 0.0f;
+                    continue;
+                }
+
+                const float Saturation = FMath::Clamp((Theta[LayerIdx] - ThetaR[LayerIdx]) / FMath::Max(Phi[LayerIdx] - ThetaR[LayerIdx], SaturationTolerance), 0.0f, 1.0f);
+                Qw[LayerIdx + 1] = Ksat[LayerIdx] * FMath::Pow(Saturation, 3.0f);
+            }
+
+            for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+            {
+                const float Influx = Qw[LayerIdx];
+                const float Outflux = Qw[LayerIdx + 1];
+                const float DeltaTheta = ((Influx - Outflux) * SubDt) / FMath::Max(Thickness[LayerIdx], MinimumLayerThickness_m);
+                Theta[LayerIdx] = FMath::Clamp(Theta[LayerIdx] + DeltaTheta, ThetaR[LayerIdx], Phi[LayerIdx]);
+
+                const float Mass = Theta[LayerIdx] * DensityWater * Thickness[LayerIdx];
+                Snow.LiquidMass_kgm2[LayerIdx] = Mass;
+                UpdateLayerDiagnostics(Snow, LayerIdx);
+            }
+
+            OutRunoff_kgm2 += Qw[Snow.LayerCount] * DensityWater * SubDt;
+        }
+    }
+
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        const float HeatCapacity = FMath::Max(GetLayerHeatCapacity(Snow, LayerIdx), MinHeatCapacity_Jm2K);
+        if (HeatCapacity <= MinHeatCapacity_Jm2K)
+        {
+            continue;
+        }
+
+        const float ColdContent = HeatCapacity * FMath::Max(FreezePoint_K - Snow.Temperature_K[LayerIdx], 0.0f);
+        if (ColdContent <= 0.0f || Snow.LiquidMass_kgm2[LayerIdx] <= KINDA_SMALL_NUMBER)
+        {
+            continue;
+        }
+
+        const float FreezeMass = FMath::Min(Snow.LiquidMass_kgm2[LayerIdx], ColdContent / FMath::Max(ModelParameters.PhysicalConstants.LatentHeatFusion_Jkg, 1.0f));
+        Snow.LiquidMass_kgm2[LayerIdx] -= FreezeMass;
+        Snow.IceMass_kgm2[LayerIdx] += FreezeMass;
+        Snow.Temperature_K[LayerIdx] = FMath::Clamp(Snow.Temperature_K[LayerIdx] + (FreezeMass * ModelParameters.PhysicalConstants.LatentHeatFusion_Jkg) / HeatCapacity, ModelParameters.Snow.MinSnowTemperature_K, FreezePoint_K);
+        UpdateLayerDiagnostics(Snow, LayerIdx);
+    }
+}
+
+void UFSM2SnowSimulation::UpdateGrainGrowth(FFSM2SnowColumn& Snow, const FFSM2SoilColumn& Soil, float SurfaceTemperatureK, float DtSeconds)
+{
+    if (Snow.LayerCount == 0 || DtSeconds <= 0.0f)
+    {
+        return;
+    }
+
+    const float FreshGrain = FMath::Clamp<float>(ModelParameters.Snow.FreshSnowGrainRadius_m, 1.0e-6f, 1.0e-2f);
+    const float LatentHeatSublimation_Jkg = ModelParameters.PhysicalConstants.LatentHeatFusion_Jkg + ModelParameters.PhysicalConstants.LatentHeatVapor_Jkg;
+    const float DensityWater = ModelParameters.PhysicalConstants.DensityWater_kgm3;
+    const float e0 = ModelParameters.PhysicalConstants.SaturationVapourPressure0_Pa;
+    const float Rv = ModelParameters.PhysicalConstants.GasConstantWaterVapour_JkgK;
+
+    switch (ModelParameters.Snow.GrainGrowthScheme)
+    {
+    case EFSM2GrainGrowthScheme::None:
+        for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+        {
+            if (GetLayerMass(Snow, LayerIdx) < KINDA_SMALL_NUMBER)
+            {
+                continue;
+            }
+            Snow.GrainRadius_m[LayerIdx] = FreshGrain;
+        }
+        break;
+
+    case EFSM2GrainGrowthScheme::TemperatureDependent:
+        for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+        {
+            if (GetLayerMass(Snow, LayerIdx) < KINDA_SMALL_NUMBER)
+            {
+                continue;
+            }
+
+            float Grain = FMath::Clamp<float>(Snow.GrainRadius_m[LayerIdx], 1.0e-6f, 1.0e-2f);
+            float GrowthRate = 2.0e-13f;
+            const float TemperatureK = Snow.Temperature_K[LayerIdx];
+            if (TemperatureK < FreezePoint_K)
+            {
+                if (Grain < 1.5e-4f)
+                {
+                    GrowthRate = 2.0e-14f;
+                }
+                else
+                {
+                    GrowthRate = 7.3e-8f * FMath::Exp(-4600.0f / FMath::Max<float>(TemperatureK, 150.0f));
+                }
+            }
+
+            Grain += DtSeconds * GrowthRate / FMath::Max<float>(Grain, 1.0e-6f);
+            Snow.GrainRadius_m[LayerIdx] = FMath::Clamp<float>(Grain, 1.0e-6f, 1.0e-2f);
+        }
+        break;
+
+    case EFSM2GrainGrowthScheme::TemperatureGradient:
+        for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+        {
+            if (GetLayerMass(Snow, LayerIdx) < KINDA_SMALL_NUMBER)
+            {
+                continue;
+            }
+
+            float Grain = FMath::Clamp<float>(Snow.GrainRadius_m[LayerIdx], 1.0e-6f, 1.0e-2f);
+            const float Thickness = FMath::Max<float>(Snow.Thickness_m[LayerIdx], MinimumLayerThickness_m);
+
+            float UpperTempK = SurfaceTemperatureK; // Start with surface temperature
+            if (LayerIdx > 0)
+            {
+                const float Weight = FMath::Max<float>(Snow.Thickness_m[LayerIdx - 1] + Thickness, MinimumLayerThickness_m);
+                UpperTempK = (Snow.Thickness_m[LayerIdx - 1] * Snow.Temperature_K[LayerIdx] + Thickness * Snow.Temperature_K[LayerIdx - 1]) / FMath::Max<float>(Weight, MinimumLayerThickness_m);
+            }
+
+            float LowerTempK = Soil.Temperature_K[0]; // Start with top soil temperature
+            if (LayerIdx + 1 < Snow.LayerCount)
+            {
+                const float Weight = FMath::Max<float>(Snow.Thickness_m[LayerIdx + 1] + Thickness, MinimumLayerThickness_m);
+                LowerTempK = (Snow.Thickness_m[LayerIdx + 1] * Snow.Temperature_K[LayerIdx] + Thickness * Snow.Temperature_K[LayerIdx + 1]) / FMath::Max<float>(Weight, MinimumLayerThickness_m);
+            }
+
+            const float TempGradient = FMath::Abs(UpperTempK - LowerTempK) / Thickness;
+            const float LiquidVolumeFraction = Snow.LiquidMass_kgm2[LayerIdx] / (DensityWater * Thickness);
+
+            float GrowthRate = 0.0f;
+            if (LiquidVolumeFraction < 1.0e-4f)
+            {
+                const float TempK = FMath::Clamp<float>(Snow.Temperature_K[LayerIdx], 150.0f, 320.0f);
+                const float DpdT = (e0 / (Rv * TempK * TempK)) * ((LatentHeatSublimation_Jkg / (Rv * TempK)) - 1.0f) * FMath::Exp((LatentHeatSublimation_Jkg / Rv) * (1.0f / FreezePoint_K - 1.0f / TempK));
+                const float Qv = 9.2e-5f * FMath::Pow(TempK / FreezePoint_K, 6.0f) * DpdT * TempGradient;
+                GrowthRate = 1.25e-7f * FMath::Min<float>(Qv, 1.0e-6f);
+            }
+            else
+            {
+                GrowthRate = 1.0e-12f * FMath::Min<float>(LiquidVolumeFraction + 0.05f, 0.14f);
+            }
+
+            Grain += DtSeconds * GrowthRate / FMath::Max<float>(Grain, 1.0e-6f);
+            Snow.GrainRadius_m[LayerIdx] = FMath::Clamp<float>(Grain, 1.0e-6f, 1.0e-2f);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+void UFSM2SnowSimulation::RebuildLayers(FFSM2SnowColumn& Snow)
+{
+    CullAndMergeLayers(Snow);
+
+    const int32 OldCount = Snow.LayerCount;
+    if (OldCount <= 0)
+    {
+        Snow.LayerCount = 0;
+        for (int32 Idx = 0; Idx < GFSM2MaxLayers; ++Idx)
+        {
+            Snow.Thickness_m[Idx] = 0.0f;
+            Snow.Temperature_K[Idx] = FreezePoint_K;
+            Snow.IceMass_kgm2[Idx] = 0.0f;
+            Snow.LiquidMass_kgm2[Idx] = 0.0f;
+            Snow.Density_kgm3[Idx] = ModelParameters.Snow.MinSnowDensity_kgm3;
+            Snow.GrainRadius_m[Idx] = FMath::Clamp(ModelParameters.Snow.FreshSnowGrainRadius_m, 1.0e-6f, 1.0e-2f);
+            Snow.AgeHours[Idx] = 0.0f;
+        }
+        return;
+    }
+
+    TStaticArray<float, GFSM2MaxLayers> OldThickness;
+    TStaticArray<float, GFSM2MaxLayers> OldIce;
+    TStaticArray<float, GFSM2MaxLayers> OldLiquid;
+    TStaticArray<float, GFSM2MaxLayers> OldEnergy;
+    TStaticArray<float, GFSM2MaxLayers> OldGrain;
+    TStaticArray<float, GFSM2MaxLayers> OldAge;
+
+    for (int32 Idx = 0; Idx < GFSM2MaxLayers; ++Idx)
+    {
+        OldThickness[Idx] = 0.0f;
+        OldIce[Idx] = 0.0f;
+        OldLiquid[Idx] = 0.0f;
+        OldEnergy[Idx] = 0.0f;
+        OldGrain[Idx] = ModelParameters.Snow.FreshSnowGrainRadius_m;
+        OldAge[Idx] = 0.0f;
+    }
+
+    float TotalMass = 0.0f;
+    float TotalThickness = 0.0f;
+
+    for (int32 Idx = 0; Idx < OldCount; ++Idx)
+    {
+        const float IceMass = FMath::Max(Snow.IceMass_kgm2[Idx], 0.0f);
+        const float LiquidMass = FMath::Max(Snow.LiquidMass_kgm2[Idx], 0.0f);
+        const float StoredDensity = FMath::Max(Snow.Density_kgm3[Idx], ModelParameters.Snow.MinSnowDensity_kgm3);
+        const float LayerMass = IceMass + LiquidMass;
+
+        OldIce[Idx] = IceMass;
+        OldLiquid[Idx] = LiquidMass;
+        OldGrain[Idx] = FMath::Clamp(Snow.GrainRadius_m[Idx], 1.0e-6f, 1.0e-2f);
+        OldAge[Idx] = FMath::Max(Snow.AgeHours[Idx], 0.0f);
+
+        const float HeatCapacity = IceMass * ModelParameters.PhysicalConstants.SpecificHeatIce_JkgK + LiquidMass * ModelParameters.PhysicalConstants.SpecificHeatWater_JkgK;
+        OldEnergy[Idx] = HeatCapacity * (Snow.Temperature_K[Idx] - FreezePoint_K);
+
+        float LayerThickness = 0.0f;
+        if (LayerMass > KINDA_SMALL_NUMBER && StoredDensity > 1.0f)
+        {
+            LayerThickness = LayerMass / StoredDensity;
+        }
+
+        OldThickness[Idx] = FMath::Max(LayerThickness, 0.0f);
+        TotalMass += LayerMass;
+        TotalThickness += OldThickness[Idx];
+    }
+
+    if (TotalMass <= KINDA_SMALL_NUMBER)
+    {
+        Snow.LayerCount = 0;
+        for (int32 Idx = 0; Idx < GFSM2MaxLayers; ++Idx)
+        {
+            Snow.Thickness_m[Idx] = 0.0f;
+            Snow.Temperature_K[Idx] = FreezePoint_K;
+            Snow.IceMass_kgm2[Idx] = 0.0f;
+            Snow.LiquidMass_kgm2[Idx] = 0.0f;
+            Snow.Density_kgm3[Idx] = ModelParameters.Snow.MinSnowDensity_kgm3;
+            Snow.GrainRadius_m[Idx] = FMath::Clamp(ModelParameters.Snow.FreshSnowGrainRadius_m, 1.0e-6f, 1.0e-2f);
+            Snow.AgeHours[Idx] = 0.0f;
+        }
+        return;
+    }
+
+    if (TotalThickness <= KINDA_SMALL_NUMBER)
+    {
+        TotalThickness = TotalMass / FMath::Max(ModelParameters.Snow.MaxSnowDensity_kgm3, 1.0f);
+    }
+
+    const float MinLayerThickness = GetMinimumSnowLayerThickness(0);
+    const int32 MaxLayersAllowed = FMath::Clamp(ModelParameters.Layers.MaxActiveLayers, 1, GFSM2MaxLayers);
+
+    auto GetConfiguredLayerThickness = [&](int32 LayerIdx) -> float
+    {
+        return GetMinimumSnowLayerThickness(LayerIdx);
+    };
+
+    TStaticArray<float, GFSM2MaxLayers> TargetThickness;
+    for (int32 Idx = 0; Idx < GFSM2MaxLayers; ++Idx)
+    {
+        TargetThickness[Idx] = 0.0f;
+    }
+
+    int32 TargetCount = 1;
+    TargetThickness[0] = TotalThickness;
+
+    if (TargetThickness[0] > GetConfiguredLayerThickness(0))
+    {
+        float Remaining = TotalThickness;
+        for (int32 LayerIdx = 0; LayerIdx < MaxLayersAllowed; ++LayerIdx)
+        {
+            const float BaseThickness = GetMinimumSnowLayerThickness(LayerIdx);
+            TargetThickness[LayerIdx] = FMath::Min(Remaining, BaseThickness);
+            Remaining -= TargetThickness[LayerIdx];
+            TargetCount = LayerIdx + 1;
+
+            if (Remaining <= GetConfiguredLayerThickness(LayerIdx) || LayerIdx == MaxLayersAllowed - 1)
+            {
+                TargetThickness[LayerIdx] += Remaining;
+                Remaining = 0.0f;
+                break;
+            }
+        }
+    }
+    else
+    {
+        TargetThickness[0] = TotalThickness;
+        TargetCount = 1;
+    }
+
+    const int32 DesiredLayerCount = TargetCount;
+    TargetCount = FMath::Clamp(TargetCount, 1, MaxLayersAllowed);
+
+    if (DesiredLayerCount > TargetCount)
+    {
+        float SpilloverThickness = 0.0f;
+        for (int32 Idx = TargetCount; Idx < DesiredLayerCount; ++Idx)
+        {
+            SpilloverThickness += TargetThickness[Idx];
+            TargetThickness[Idx] = 0.0f;
+        }
+
+        if (TargetCount > 0)
+        {
+            TargetThickness[TargetCount - 1] += SpilloverThickness;
+        }
+    }
+
+    // Reset current snow column prior to redistribution
+    for (int32 Idx = 0; Idx < GFSM2MaxLayers; ++Idx)
+    {
+        Snow.Thickness_m[Idx] = 0.0f;
+        Snow.Temperature_K[Idx] = FreezePoint_K;
+        Snow.IceMass_kgm2[Idx] = 0.0f;
+        Snow.LiquidMass_kgm2[Idx] = 0.0f;
+        Snow.Density_kgm3[Idx] = ModelParameters.Snow.MinSnowDensity_kgm3;
+        Snow.GrainRadius_m[Idx] = FMath::Clamp(ModelParameters.Snow.FreshSnowGrainRadius_m, 1.0e-6f, 1.0e-2f);
+        Snow.AgeHours[Idx] = 0.0f;
+    }
+
+    TStaticArray<float, GFSM2MaxLayers> LayerEnergy;
+    TStaticArray<float, GFSM2MaxLayers> GrainNumerator;
+    TStaticArray<float, GFSM2MaxLayers> AgeNumerator;
+
+    for (int32 Idx = 0; Idx < GFSM2MaxLayers; ++Idx)
+    {
+        LayerEnergy[Idx] = 0.0f;
+        GrainNumerator[Idx] = 0.0f;
+        AgeNumerator[Idx] = 0.0f;
+    }
+
+    int32 NewLayerIdx = 0;
+    float RemainingTarget = (TargetCount > 0) ? TargetThickness[0] : 0.0f;
+
+    for (int32 OldIdx = 0; OldIdx < OldCount; ++OldIdx)
+    {
+        float ThicknessRemaining = OldThickness[OldIdx];
+        float IceRemaining = OldIce[OldIdx];
+        float LiquidRemaining = OldLiquid[OldIdx];
+        float EnergyRemaining = OldEnergy[OldIdx];
+        const float GrainValue = OldGrain[OldIdx];
+        const float AgeValue = OldAge[OldIdx];
+
+        while (ThicknessRemaining > KINDA_SMALL_NUMBER && TargetCount > 0)
+        {
+            if (NewLayerIdx >= TargetCount)
+            {
+                NewLayerIdx = TargetCount - 1;
+            }
+
+            if (NewLayerIdx == TargetCount - 1)
+            {
+                RemainingTarget = FMath::Max(RemainingTarget, ThicknessRemaining);
+            }
+
+            if (RemainingTarget <= KINDA_SMALL_NUMBER)
+            {
+                if (NewLayerIdx < TargetCount - 1)
+                {
+                    ++NewLayerIdx;
+                    RemainingTarget = TargetThickness[NewLayerIdx];
+                    continue;
+                }
+                RemainingTarget = ThicknessRemaining;
+            }
+
+            const float TransferThickness = FMath::Min(ThicknessRemaining, RemainingTarget);
+            if (TransferThickness <= KINDA_SMALL_NUMBER)
+            {
+                break;
+            }
+
+            const float Fraction = (ThicknessRemaining > KINDA_SMALL_NUMBER) ? (TransferThickness / ThicknessRemaining) : 1.0f;
+
+            const float IceTransfer = IceRemaining * Fraction;
+            const float LiquidTransfer = LiquidRemaining * Fraction;
+            const float EnergyTransfer = EnergyRemaining * Fraction;
+            const float MassTransfer = IceTransfer + LiquidTransfer;
+
+            Snow.IceMass_kgm2[NewLayerIdx] += IceTransfer;
+            Snow.LiquidMass_kgm2[NewLayerIdx] += LiquidTransfer;
+            LayerEnergy[NewLayerIdx] += EnergyTransfer;
+            GrainNumerator[NewLayerIdx] += IceTransfer * GrainValue;
+            AgeNumerator[NewLayerIdx] += MassTransfer * AgeValue;
+
+            ThicknessRemaining -= TransferThickness;
+            IceRemaining -= IceTransfer;
+            LiquidRemaining -= LiquidTransfer;
+            EnergyRemaining -= EnergyTransfer;
+
+            RemainingTarget = FMath::Max(RemainingTarget - TransferThickness, 0.0f);
+
+            if (RemainingTarget <= KINDA_SMALL_NUMBER && NewLayerIdx < TargetCount - 1)
+            {
+                ++NewLayerIdx;
+                if (NewLayerIdx < TargetCount)
+                {
+                    RemainingTarget = TargetThickness[NewLayerIdx];
+                }
+            }
+        }
+    }
+
+    Snow.LayerCount = TargetCount;
+
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        const float Mass = Snow.IceMass_kgm2[LayerIdx] + Snow.LiquidMass_kgm2[LayerIdx];
+        const float HeatCapacity = Snow.IceMass_kgm2[LayerIdx] * ModelParameters.PhysicalConstants.SpecificHeatIce_JkgK + Snow.LiquidMass_kgm2[LayerIdx] * ModelParameters.PhysicalConstants.SpecificHeatWater_JkgK;
+
+        Snow.Thickness_m[LayerIdx] = TargetThickness[LayerIdx];
+
+        if (HeatCapacity > MinHeatCapacity_Jm2K)
+        {
+            const float DiagnosedTempK = FreezePoint_K + LayerEnergy[LayerIdx] / HeatCapacity;
+            Snow.Temperature_K[LayerIdx] = FMath::Clamp(DiagnosedTempK, ModelParameters.Snow.MinSnowTemperature_K, FreezePoint_K);
+        }
+        else
+        {
+            Snow.Temperature_K[LayerIdx] = FreezePoint_K;
+        }
+
+        if (Snow.IceMass_kgm2[LayerIdx] > KINDA_SMALL_NUMBER)
+        {
+            Snow.GrainRadius_m[LayerIdx] = FMath::Clamp(GrainNumerator[LayerIdx] / Snow.IceMass_kgm2[LayerIdx], 1.0e-6f, 1.0e-2f);
+        }
+        else
+        {
+            Snow.GrainRadius_m[LayerIdx] = FMath::Clamp(ModelParameters.Snow.FreshSnowGrainRadius_m, 1.0e-6f, 1.0e-2f);
+        }
+
+        const float MassForAge = FMath::Max(Mass, KINDA_SMALL_NUMBER);
+        Snow.AgeHours[LayerIdx] = AgeNumerator[LayerIdx] / MassForAge;
+
+        float Density = 0.0f;
+        if (Snow.Thickness_m[LayerIdx] > KINDA_SMALL_NUMBER)
+        {
+            Density = Mass / Snow.Thickness_m[LayerIdx];
+        }
+        Density = FMath::Clamp(Density, ModelParameters.Snow.MinSnowDensity_kgm3, ModelParameters.Snow.MaxSnowDensity_kgm3);
+        Snow.Density_kgm3[LayerIdx] = Density;
+        Snow.Thickness_m[LayerIdx] = (Density > 1.0f) ? Mass / Density : 0.0f;
+
+        UpdateLayerDiagnostics(Snow, LayerIdx);
+    }
+
+    for (int32 LayerIdx = Snow.LayerCount; LayerIdx < GFSM2MaxLayers; ++LayerIdx)
+    {
+        Snow.Thickness_m[LayerIdx] = 0.0f;
+        Snow.Temperature_K[LayerIdx] = FreezePoint_K;
+        Snow.IceMass_kgm2[LayerIdx] = 0.0f;
+        Snow.LiquidMass_kgm2[LayerIdx] = 0.0f;
+        Snow.Density_kgm3[LayerIdx] = ModelParameters.Snow.MinSnowDensity_kgm3;
+        Snow.GrainRadius_m[LayerIdx] = FMath::Clamp(ModelParameters.Snow.FreshSnowGrainRadius_m, 1.0e-6f, 1.0e-2f);
+        Snow.AgeHours[LayerIdx] = 0.0f;
+    }
+}
+
+void UFSM2SnowSimulation::InitializeColumnDefaults(FFSM2ColumnState& Column) const
+{
+    Column.Reset();
+    InitializeSoilProfile(Column.Soil);
+}
+
+void UFSM2SnowSimulation::CalculateSurfaceLayerThermalProperties(const FFSM2SnowColumn& Snow, const FFSM2SoilColumn& Soil, float& OutSurfaceLayerThickness, float& OutSurfaceLayerTemperature, float& OutSurfaceLayerConductivity) const
+{
+    const int32 SnowCount = FMath::Clamp(Snow.LayerCount, 0, GFSM2MaxLayers);
+    const int32 SoilCount = FMath::Clamp(Soil.LayerCount, 0, GFSM2MaxSoilLayers);
+
+    // Default values
+    OutSurfaceLayerTemperature = ModelParameters.Soil.GroundTemperature_K;
+    OutSurfaceLayerConductivity = ModelParameters.Soil.GroundConductivity_WmK;
+    OutSurfaceLayerThickness = FMath::Max(ModelParameters.Layers.SoilLayerThicknesses_m.Num() > 0 ? ModelParameters.Layers.SoilLayerThicknesses_m[0] : MinimumLayerThickness_m, MinimumLayerThickness_m);
+
+    if (SoilCount == 0)
+    {
+        return;
+    }
+
+    // Get top soil layer properties
+    const float SoilThickness = FMath::Max(Soil.Thickness_m[0], MinimumLayerThickness_m);
+    const float SoilTemperature = Soil.Temperature_K[0];
+
+    // Calculate soil thermal conductivity for surface layer
+    TArray<double> SoilThicknessArray, SoilConductivityArray, SoilHeatCapacityArray;
+    EvaluateSoilThermalProfile(Soil, SoilThicknessArray, SoilConductivityArray, SoilHeatCapacityArray);
+    const float SoilConductivity = (SoilConductivityArray.Num() > 0) ? SoilConductivityArray[0] : ModelParameters.Soil.ThermalConductivity_WmK;
+
+    OutSurfaceLayerThickness = SoilThickness;
+
+    if (SnowCount == 0)
+    {
+        // No snow - surface layer is just the top soil layer
+        OutSurfaceLayerTemperature = SoilTemperature;
+        OutSurfaceLayerConductivity = SoilConductivity;
+        return;
+    }
+
+    // Snow is present - calculate combined surface layer properties
+    const float SnowThickness = FMath::Max(Snow.Thickness_m[0], MinimumLayerThickness_m);
+    const float SnowTemperature = Snow.Temperature_K[0];
+    const float SnowConductivity = GetLayerThermalConductivity(Snow, 0);
+    const float TotalSnowDepth = ComputeSnowDepthMeters(Snow);
+
+    // Surface layer thickness is maximum of soil and snow layer thicknesses
+    OutSurfaceLayerThickness = FMath::Max(SoilThickness, SnowThickness);
+
+    // Surface layer temperature calculation (following FSM2 Fortran)
+    if (TotalSnowDepth <= SoilThickness)
+    {
+        // Shallow snow - weighted average temperature
+        OutSurfaceLayerTemperature = SoilTemperature + (SnowTemperature - SoilTemperature) * SnowThickness / SoilThickness;
+    }
+    else
+    {
+        // Deep snow - surface temperature is snow temperature
+        OutSurfaceLayerTemperature = SnowTemperature;
+    }
+
+    // Surface layer thermal conductivity calculation (harmonic mean for thermal resistance)
+    if (TotalSnowDepth <= 0.5f * SoilThickness)
+    {
+        // Shallow snow - harmonic mean of thermal conductivities weighted by thicknesses
+        // λ₁ = Δz_sl,1 / (2*D_sn,1/λ_sn,1 + (Δz_sl,1 - 2*D_sn,1)/λ_sl,1)
+        const float Term1 = 2.0f * SnowThickness / SnowConductivity;
+        const float Term2 = (SoilThickness - 2.0f * SnowThickness) / SoilConductivity;
+        const float Denominator = Term1 + Term2;
+
+        if (Denominator > KINDA_SMALL_NUMBER)
+        {
+            OutSurfaceLayerConductivity = SoilThickness / Denominator;
+        }
+        else
+        {
+            OutSurfaceLayerConductivity = SnowConductivity;
+        }
+    }
+    else
+    {
+        // Deep snow - surface conductivity is snow conductivity
+        OutSurfaceLayerConductivity = SnowConductivity;
+    }
+
+    // Clamp to reasonable values
+    OutSurfaceLayerConductivity = FMath::Clamp(OutSurfaceLayerConductivity, 0.01f, 10.0f);
+}
+
+void UFSM2SnowSimulation::CalculateSoilProperties(float& OutClappHornbergerExponent, float& OutVolumetricHeatCapacityDry, float& OutThermalConductivityDry, float& OutSaturatedMatricPotential, float& OutCriticalVolumetricWater, float& OutSaturatedVolumetricWater) const
+{
+    // Calculate soil properties from clay and sand fractions (following FSM2 Fortran implementation)
+    const float Fcly = FMath::Clamp(ModelParameters.Soil.ClayFraction, 0.0f, 1.0f);
+    const float Fsnd = FMath::Clamp(ModelParameters.Soil.SandFraction, 0.0f, 1.0f);
+
+    // Clapp-Hornberger exponent
+    OutClappHornbergerExponent = 3.1f + 15.7f * Fcly - 0.3f * Fsnd;
+
+    // Volumetric heat capacity of dry soil (J/m³/K)
+    const float ClayHcap = 2.128e6f; // J/m³/K
+    const float SandHcap = 2.385e6f; // J/m³/K
+    OutVolumetricHeatCapacityDry = (ClayHcap * Fcly + SandHcap * Fsnd) / FMath::Max(Fcly + Fsnd, 1e-6f);
+
+    // Saturated volumetric water content
+    OutSaturatedVolumetricWater = 0.505f - 0.037f * Fcly - 0.142f * Fsnd;
+
+    // Saturated matric potential (m)
+    OutSaturatedMatricPotential = FMath::Pow(10.0f, 0.17f - 0.63f * Fcly - 1.58f * Fsnd);
+
+    // Critical volumetric water content
+    const float ReferencePotential = 3.364f; // m
+    OutCriticalVolumetricWater = OutSaturatedVolumetricWater * FMath::Pow(OutSaturatedMatricPotential / ReferencePotential, 1.0f / OutClappHornbergerExponent);
+
+    // Dry soil thermal conductivity (W/m/K)
+    const float HconAir = ModelParameters.PhysicalConstants.ThermalConductivityAir_WmK;
+    const float HconClay = ModelParameters.PhysicalConstants.ThermalConductivityClay_WmK;
+    const float HconSand = ModelParameters.PhysicalConstants.ThermalConductivitySand_WmK;
+    const float Vsat = OutSaturatedVolumetricWater;
+
+    OutThermalConductivityDry = FMath::Pow(HconAir, Vsat) *
+        FMath::Pow(FMath::Pow(HconClay, Fcly) * FMath::Pow(HconSand, 1.0f - Fcly), 1.0f - Vsat);
+}
+
+void UFSM2SnowSimulation::EvaluateSoilThermalProfile(const FFSM2SoilColumn& Soil, TArray<double>& OutThickness, TArray<double>& OutConductivity, TArray<double>& OutHeatCapacity) const
+{
+    const int32 SoilCount = FMath::Clamp(Soil.LayerCount, 0, GFSM2MaxSoilLayers);
+    OutThickness.Reset();
+    OutConductivity.Reset();
+    OutHeatCapacity.Reset();
+
+    if (SoilCount == 0)
+    {
+        return;
+    }
+
+    // Calculate soil properties from composition
+    float B, HcapSoil, HconSoil, Sathh, Vcrit, Vsat;
+    CalculateSoilProperties(B, HcapSoil, HconSoil, Sathh, Vcrit, Vsat);
+
+    OutThickness.Reserve(SoilCount);
+    OutConductivity.Reserve(SoilCount);
+    OutHeatCapacity.Reserve(SoilCount);
+
+    // Calculate dPsidT (temperature derivative of ice potential)
+    const float RhoIce = ModelParameters.PhysicalConstants.DensityIce_kgm3;
+    const float Lf = ModelParameters.PhysicalConstants.LatentHeatFusion_Jkg;
+    const float G = ModelParameters.PhysicalConstants.Gravity_mps2;
+    const float Tm = ModelParameters.PhysicalConstants.MeltingPoint_K;
+    const float DPsidT = -RhoIce * Lf / (ModelParameters.PhysicalConstants.DensityWater_kgm3 * G * Tm);
+
+    for (int32 SoilIdx = 0; SoilIdx < SoilCount; ++SoilIdx)
+    {
+        const float Thickness = FMath::Max<double>(Soil.Thickness_m[SoilIdx], MinimumLayerThickness_m);
+        const float Temperature = Soil.Temperature_K[SoilIdx];
+        const float Moisture = FMath::Clamp(Soil.Moisture_VolumeFraction[SoilIdx], 0.0f, 1.0f);
+
+        OutThickness.Add(Thickness);
+
+        // Start with dry soil heat capacity
+        double HeatCapacity = HcapSoil * Thickness;
+
+        // Start with dry soil thermal conductivity
+        double Conductivity = HconSoil;
+
+        if (Moisture > KINDA_SMALL_NUMBER)
+        {
+            // Calculate unfrozen and frozen moisture fractions based on temperature
+            float DthudT = 0.0f; // Derivative of unfrozen water content w.r.t. temperature
+            float Sthu = Moisture; // Unfrozen moisture content
+            float Sthf = 0.0f; // Frozen moisture content
+            const float Tc = Temperature - Tm; // Temperature in °C
+
+            const float Tmax = Tm + (Sathh / DPsidT) * FMath::Pow(Vsat / Moisture, B);
+            if (Temperature < Tmax)
+            {
+                DthudT = (-DPsidT * Vsat / (B * Sathh)) * FMath::Pow(DPsidT * Tc / Sathh, -1.0f / B - 1.0f);
+                Sthu = Vsat * FMath::Pow(DPsidT * Tc / Sathh, -1.0f / B);
+                Sthu = FMath::Min(Sthu, Moisture);
+                Sthf = (Moisture - Sthu) * ModelParameters.PhysicalConstants.DensityWater_kgm3 / RhoIce;
+            }
+
+            // Calculate masses
+            const float Mf = RhoIce * Thickness * Sthf; // Frozen moisture mass (kg/m²)
+            const float Mu = ModelParameters.PhysicalConstants.DensityWater_kgm3 * Thickness * Sthu; // Unfrozen moisture mass (kg/m²)
+
+            // Update heat capacity including phase change effects
+            HeatCapacity = HcapSoil * Thickness +
+                          ModelParameters.PhysicalConstants.SpecificHeatIce_JkgK * Mf +
+                          ModelParameters.PhysicalConstants.SpecificHeatWater_JkgK * Mu +
+                          ModelParameters.PhysicalConstants.DensityWater_kgm3 * Thickness *
+                          ((ModelParameters.PhysicalConstants.SpecificHeatWater_JkgK - ModelParameters.PhysicalConstants.SpecificHeatIce_JkgK) * Tc + Lf) * DthudT;
+
+            // Calculate volumetric fractions for thermal conductivity
+            const float Smf = RhoIce * Sthf / (ModelParameters.PhysicalConstants.DensityWater_kgm3 * Vsat); // Fractional frozen moisture
+            const float Smu = Sthu / Vsat; // Fractional unfrozen moisture
+
+            float Thice = 0.0f;
+            if (Smf > 0.0f)
+            {
+                Thice = Vsat * Smf / (Smu + Smf);
+            }
+
+            float Thwat = 0.0f;
+            if (Smu > 0.0f)
+            {
+                Thwat = Vsat * Smu / (Smu + Smf);
+            }
+
+            // Calculate saturated thermal conductivity
+            const float HconWat = ModelParameters.PhysicalConstants.ThermalConductivityWater_WmK;
+            const float HconIce = ModelParameters.PhysicalConstants.ThermalConductivityIce_WmK;
+            const float HconAir = ModelParameters.PhysicalConstants.ThermalConductivityAir_WmK;
+
+            const float HconSat = HconSoil * FMath::Pow(HconWat, Thwat) * FMath::Pow(HconIce, Thice) / FMath::Pow(HconAir, Vsat);
+
+            // Final thermal conductivity
+            Conductivity = (HconSat - HconSoil) * (Smf + Smu) + HconSoil;
+        }
+
+        OutHeatCapacity.Add(FMath::Max(HeatCapacity, MinHeatCapacity_Jm2K));
+        OutConductivity.Add(FMath::Max(Conductivity, 1e-3));
+    }
+}
+
+float UFSM2SnowSimulation::ComputeSurfaceMoistureConductance(const FFSM2SoilColumn& Soil) const
+{
+    const int32 SoilCount = FMath::Clamp(Soil.LayerCount, 0, GFSM2MaxSoilLayers);
+    if (SoilCount <= 0)
+    {
+        return ModelParameters.Soil.SurfaceMoistureConductance_ms;
+    }
+
+    float B, HcapSoil, HconSoil, Sathh, Vcrit, Vsat;
+    CalculateSoilProperties(B, HcapSoil, HconSoil, Sathh, Vcrit, Vsat);
+
+    const float Moisture = FMath::Clamp(Soil.Moisture_VolumeFraction[0], 0.0f, 1.0f);
+    if (Moisture <= KINDA_SMALL_NUMBER || Vsat <= KINDA_SMALL_NUMBER)
+    {
+        return FMath::Max(ModelParameters.Soil.SurfaceMoistureConductance_ms, ModelParameters.Soil.SaturatedSurfaceConductance_ms);
+    }
+
+    const float SaturatedConductance = FMath::Max(ModelParameters.Soil.SaturatedSurfaceConductance_ms, 0.0f);
+    const float Tm = ModelParameters.PhysicalConstants.MeltingPoint_K;
+    const float Temperature = Soil.Temperature_K[0];
+
+    const float RhoIce = ModelParameters.PhysicalConstants.DensityIce_kgm3;
+    const float RhoWater = ModelParameters.PhysicalConstants.DensityWater_kgm3;
+    const float Lf = ModelParameters.PhysicalConstants.LatentHeatFusion_Jkg;
+    const float G = ModelParameters.PhysicalConstants.Gravity_mps2;
+
+    const float DPsidT = -RhoIce * Lf / (RhoWater * G * Tm);
+
+    float Sthu = Moisture;
+    if (Sathh > KINDA_SMALL_NUMBER)
+    {
+        const float Tc = Temperature - Tm;
+        const float MoistureClamp = FMath::Max(Moisture, 1.0e-6f);
+        const float Tmax = Tm + (Sathh / DPsidT) * FMath::Pow(Vsat / MoistureClamp, B);
+
+        if (Temperature < Tmax)
+        {
+            const float Argument = DPsidT * Tc / Sathh;
+            if (Argument > 0.0f)
+            {
+                Sthu = FMath::Min(Vsat * FMath::Pow(Argument, -1.0f / B), Moisture);
+            }
+        }
+    }
+
+    float Conductance = FMath::Max(ModelParameters.Soil.SurfaceMoistureConductance_ms, SaturatedConductance);
+    if (Vcrit > KINDA_SMALL_NUMBER && SaturatedConductance > 0.0f)
+    {
+        const float Ratio = FMath::Max(Sthu / Vcrit, 0.0f);
+        Conductance = SaturatedConductance * FMath::Max(Ratio * Ratio, 1.0f);
+    }
+
+    return Conductance;
+}
+
+void UFSM2SnowSimulation::InitializeSoilProfile(FFSM2SoilColumn& Soil) const
+{
+    Soil.Reset();
+    Soil.LayerCount = FMath::Clamp(ModelParameters.Layers.SoilLayerCount, 0, GFSM2MaxSoilLayers);
+
+    for (int32 SoilIdx = 0; SoilIdx < Soil.LayerCount; ++SoilIdx)
+    {
+        const float Thickness = ModelParameters.Layers.SoilLayerThicknesses_m.IsValidIndex(SoilIdx) ? FMath::Max(ModelParameters.Layers.SoilLayerThicknesses_m[SoilIdx], MinimumLayerThickness_m) : FMath::Pow(2.0f, static_cast<float>(SoilIdx)) * 0.1f;
+        Soil.Thickness_m[SoilIdx] = Thickness;
+        Soil.Temperature_K[SoilIdx] = FMath::Clamp(ModelParameters.Soil.InitialTemperature_K, 200.0f, 330.0f);
+        Soil.Moisture_VolumeFraction[SoilIdx] = FMath::Clamp(ModelParameters.Soil.InitialMoisture_Vol, 0.0f, 1.0f);
+    }
+}
+
+void UFSM2SnowSimulation::AgeSnowpack(FFSM2SnowColumn& Snow, float DtHours)
+{
+    if (DtHours <= 0.0f)
+    {
+        return;
+    }
+
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        Snow.AgeHours[LayerIdx] += DtHours;
+    }
+}
+
+void UFSM2SnowSimulation::ApplyCanopyExchange(float& ThroughfallSnow, float& ThroughfallRain, float& IncomingShortwave, float& IncomingLongwave) const
+{
+    if (!ModelParameters.Modules.bEnableCanopy)
+    {
+        return;
+    }
+
+    const float InterceptedSnow = ThroughfallSnow * FMath::Clamp(ModelParameters.Vegetation.SnowInterceptionFraction, 0.0f, 1.0f);
+    ThroughfallSnow -= InterceptedSnow;
+    ThroughfallRain += InterceptedSnow;
+    IncomingShortwave *= FMath::Clamp(ModelParameters.Vegetation.ShortwaveTransmittance, 0.0f, 1.0f);
+    IncomingLongwave += ModelParameters.Vegetation.LongwaveAddition_Wm2;
+}
+
+void UFSM2SnowSimulation::EnergyBalanceStage(int32 /*CellIndex*/, FFSM2ColumnState& Column, float DtSeconds, const FWeatherForcingData& Forcing, float SnowInput_kgm2, float RainInput_kgm2, float AirDensity, float AirTempK, float Qa, float PressurePa, float WindSpeed, float FreshDensity, float FreshGrainRadius, float BulkTransferCoefficient, float DiffuseSW, float DirectSW, float SurfaceAlbedo, float& OutNetSurfaceFlux, float& OutSurfaceTemperatureK, float& OutThroughfallSnow, float& OutThroughfallRain, FFSM2EnergyFluxes& OutFluxes, FFSM2SurfaceUpdate& OutSurfaceUpdate, FFSM2CellDiagnostics* OutDiagnostics)
+{
+    OutNetSurfaceFlux = 0.0f;
+    OutSurfaceTemperatureK = Column.Snow.LayerCount > 0
+        ? FMath::Clamp(Column.Snow.Temperature_K[0], ModelParameters.Snow.MinSnowTemperature_K, FreezePoint_K)
+        : FMath::Max(ModelParameters.Soil.GroundTemperature_K, ModelParameters.Snow.MinSnowTemperature_K);
+    OutThroughfallSnow = 0.0f;
+    OutThroughfallRain = 0.0f;
+    OutFluxes = FFSM2EnergyFluxes();
+    OutSurfaceUpdate = FFSM2SurfaceUpdate();
+
+    float ThroughfallSnow = SnowInput_kgm2;
+    float ThroughfallRain = RainInput_kgm2;
+    float IncomingSW = DiffuseSW + DirectSW;
+    float IncomingLW = Forcing.LWdown_Wm2;
+
+    ApplyCanopyExchange(ThroughfallSnow, ThroughfallRain, IncomingSW, IncomingLW);
+
+    // Store original snowfall for diagnostics
+    const float OriginalSnowfall = ThroughfallSnow;
+
+    const float SurfaceRain = FMath::Max(0.0f, ThroughfallRain);
+    OutThroughfallRain = SurfaceRain;
+
+    const float NetShortwave = (DiffuseSW + DirectSW) * (1.0f - SurfaceAlbedo);
+
+    float SurfaceConductance_ms = ModelParameters.Soil.SurfaceMoistureConductance_ms;
+    float SurfaceWaterAvailability = 1.0f;
+    OutNetSurfaceFlux = ComputeSurfaceEnergyBalance(Column.Snow, Column.Soil, NetShortwave, IncomingLW, AirDensity, AirTempK, Qa, PressurePa, WindSpeed, SurfaceRain, DtSeconds, BulkTransferCoefficient, OutSurfaceTemperatureK, OutFluxes, OutSurfaceUpdate, SurfaceConductance_ms, SurfaceWaterAvailability);
+
+    if (OutDiagnostics)
+    {
+        OutDiagnostics->GroundHeatFlux_Wm2 = OutNetSurfaceFlux;
+        OutDiagnostics->ForcingAirTemperatureK = AirTempK;
+        OutDiagnostics->ForcingIncomingLongwave_Wm2 = IncomingLW;
+        OutDiagnostics->ForcingIncomingShortwave_Wm2 = IncomingSW;
+        OutDiagnostics->ForcingDiffuseShortwave_Wm2 = DiffuseSW;
+        OutDiagnostics->ForcingDirectShortwave_Wm2 = DirectSW;
+        OutDiagnostics->ForcingWindSpeed_mps = WindSpeed;
+        OutDiagnostics->SurfaceMoistureConductance_ms = SurfaceConductance_ms;
+        OutDiagnostics->SurfaceMoistureAvailability = SurfaceWaterAvailability;
+    }
+
+    // Add frost formation from condensation (Fortran FSM2 style)
+    // If surface latent mass flux is positive (condensation) and surface is cold, add frost
+    float FrostFormation_kgm2 = 0.0f;
+    if (OutSurfaceUpdate.SurfaceMassFlux_kgm2s > 0.0f && OutSurfaceTemperatureK < FreezePoint_K)
+    {
+        FrostFormation_kgm2 = OutSurfaceUpdate.SurfaceMassFlux_kgm2s * DtSeconds;
+        ThroughfallSnow += FrostFormation_kgm2; // Add frost to snowfall input
+    }
+
+    // Add snowfall + frost together
+    if (ThroughfallSnow > KINDA_SMALL_NUMBER)
+    {
+        DepositionStage(Column.Snow, ThroughfallSnow, AirTempK, FreshDensity, FreshGrainRadius);
+        OutThroughfallSnow = ThroughfallSnow;
+        ThroughfallSnow = 0.0f;
+    }
+
+    if (Column.Snow.LayerCount == 0)
+    {
+        if (ThroughfallRain > KINDA_SMALL_NUMBER)
+        {
+            Column.Runoff_kgm2 += ThroughfallRain;
+        }
+
+        if (OutDiagnostics)
+        {
+            OutDiagnostics->ThroughfallSnow_kgm2 = OriginalSnowfall;  // Original snowfall input
+            OutDiagnostics->ThroughfallRain_kgm2 = OutThroughfallRain;
+            OutDiagnostics->FrostMass_kgm2 = FrostFormation_kgm2;
+            OutDiagnostics->Fluxes = OutFluxes;
+            OutDiagnostics->MeltMass_kgm2 = 0.0f;
+            OutDiagnostics->RefreezeMass_kgm2 = 0.0f;
+        }
+        return;
+    }
+
+    if (OutDiagnostics)
+    {
+        OutDiagnostics->ThroughfallSnow_kgm2 = OriginalSnowfall;  // Original snowfall input
+        OutDiagnostics->ThroughfallRain_kgm2 = OutThroughfallRain;
+        OutDiagnostics->FrostMass_kgm2 = FrostFormation_kgm2;
+        OutDiagnostics->Fluxes = OutFluxes;
+        OutDiagnostics->MeltMass_kgm2 = OutSurfaceUpdate.MeltMass_kgm2;
+        OutDiagnostics->RefreezeMass_kgm2 = OutSurfaceUpdate.RefreezeMass_kgm2;
+    }
+}
+
+void UFSM2SnowSimulation::DepositionStage(FFSM2SnowColumn& Snow, float ThroughfallSnow, float AirTempK, float FreshDensity, float FreshGrainRadius)
+{
+    if (ThroughfallSnow <= KINDA_SMALL_NUMBER)
+    {
+        return;
+    }
+
+    InsertSurfaceLayer(Snow, ThroughfallSnow, 0.0f, FreshDensity, FMath::Clamp(AirTempK, ModelParameters.Snow.MinSnowTemperature_K, FreezePoint_K), FreshGrainRadius);
+}
+
+float UFSM2SnowSimulation::ComputeSurfaceEnergyBalance(const FFSM2SnowColumn& Snow, const FFSM2SoilColumn& Soil, float NetShortwave, float IncomingLongwave, float AirDensity, float AirTempK, float Qa, float PressurePa, float WindSpeed, float ThroughfallRain, float DtSeconds, float BulkTransferCoefficient, float& OutSurfaceTemperatureK, FFSM2EnergyFluxes& OutFluxes, FFSM2SurfaceUpdate& OutSurfaceUpdate, float& OutSurfaceMoistureConductance_ms, float& OutSurfaceMoistureAvailability) const
+{
+    OutFluxes = FFSM2EnergyFluxes();
+    OutSurfaceUpdate = FFSM2SurfaceUpdate();
+    OutSurfaceMoistureConductance_ms = ModelParameters.Soil.SurfaceMoistureConductance_ms;
+    OutSurfaceMoistureAvailability = 1.0f;
+
+    if (DtSeconds <= 0.0f)
+    {
+        const float GroundTemperature = (Soil.LayerCount > 0) ? Soil.Temperature_K[0] : ModelParameters.Soil.GroundTemperature_K;
+        OutSurfaceTemperatureK = (Snow.LayerCount > 0)
+            ? FMath::Clamp(Snow.Temperature_K[0], ModelParameters.Snow.MinSnowTemperature_K, FreezePoint_K)
+            : GroundTemperature;
+        if (Soil.LayerCount > 0)
+        {
+            OutSurfaceMoistureConductance_ms = ComputeSurfaceMoistureConductance(Soil);
+        }
+        return 0.0f;
+    }
+
+    const bool bHasSnow = Snow.LayerCount > 0;
+    const float MinSnowTempK = ModelParameters.Snow.MinSnowTemperature_K;
+    const float GroundTemperature = (Soil.LayerCount > 0) ? Soil.Temperature_K[0] : ModelParameters.Soil.GroundTemperature_K;
+    float InitialTemp = bHasSnow
+        ? FMath::Clamp(Snow.Temperature_K[0], MinSnowTempK, FreezePoint_K)
+        : GroundTemperature;
+    const float InitialIce = bHasSnow ? FMath::Max(0.0f, Snow.IceMass_kgm2[0]) : 0.0f;
+    const float InitialLiquid = bHasSnow ? FMath::Max(0.0f, Snow.LiquidMass_kgm2[0]) : 0.0f;
+    float HeatCapacity = bHasSnow ? FMath::Max(GetLayerHeatCapacity(Snow, 0), MinHeatCapacity_Jm2K) : 0.0f;
+
+    float TotalColumnIceMass = 0.0f;
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        TotalColumnIceMass += FMath::Max(0.0f, Snow.IceMass_kgm2[LayerIdx]);
+    }
+
+    const float SnowCoverFraction = ComputeSnowCoverFraction(Snow);
+    const bool bHasCanopyExchange = ModelParameters.Modules.bEnableCanopy && ModelParameters.Layers.CanopyLayerCount > 0;
+    float MeasurementWindHeight = ModelParameters.Atmosphere.WindMeasurementHeight_m;
+    float MeasurementTempHeight = ModelParameters.Atmosphere.TemperatureMeasurementHeight_m;
+    AdjustMeasurementHeights(MeasurementWindHeight, MeasurementTempHeight);
+    MeasurementWindHeight = FMath::Max(MeasurementWindHeight, 0.5f);
+    MeasurementTempHeight = FMath::Max(MeasurementTempHeight, 0.5f);
+    const float VonKarman = ModelParameters.PhysicalConstants.VonKarman;
+    const float Gravity = ModelParameters.PhysicalConstants.Gravity_mps2;
+    const float MinimumWindSpeed = FMath::Max(ModelParameters.Atmosphere.MinimumWindSpeed_mps, 0.1f);
+    const float EffectiveWindSpeed = FMath::Max(WindSpeed, MinimumWindSpeed);
+    const float LegacyConductance = FMath::Max(BulkTransferCoefficient * EffectiveWindSpeed, 1.0e-5f);
+    float LastAerodynamicConductance = LegacyConductance;
+
+    // Calculate surface layer thermal properties for shallow snow conditions
+    float SurfaceLayerThickness, SurfaceLayerTemperature, SurfaceLayerConductivity;
+    CalculateSurfaceLayerThermalProperties(Snow, Soil, SurfaceLayerThickness, SurfaceLayerTemperature, SurfaceLayerConductivity);
+
+    TArray<double> SoilThicknessProfile;
+    TArray<double> SoilConductivityProfile;
+    TArray<double> SoilHeatCapacityProfile;
+    if (Soil.LayerCount > 0)
+    {
+        EvaluateSoilThermalProfile(Soil, SoilThicknessProfile, SoilConductivityProfile, SoilHeatCapacityProfile);
+    }
+
+    // Fortran FSM2 does not lump soil heat capacity into the surface state.
+    // Keep conduction via (ks1, Ts1, Ds1) only; no discrete heat-capacity jump in shallow snow.
+
+    const bool bBareGround = !bHasSnow && Soil.LayerCount > 0;
+    if (bBareGround && SoilHeatCapacityProfile.Num() > 0)
+    {
+        HeatCapacity = FMath::Max(HeatCapacity, static_cast<float>(SoilHeatCapacityProfile[0]));
+    }
+
+    if (bHasSnow && SurfaceLayerThickness > KINDA_SMALL_NUMBER)
+    {
+        float CombinedHeatCapacity = 0.0f;
+        double WeightedEnergy = 0.0;
+        float RemainingDepth = SurfaceLayerThickness;
+
+        for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount && RemainingDepth > KINDA_SMALL_NUMBER; ++LayerIdx)
+        {
+            const float LayerThickness = FMath::Max(Snow.Thickness_m[LayerIdx], MinimumLayerThickness_m);
+            const float Portion = FMath::Min(LayerThickness, RemainingDepth);
+            if (Portion <= KINDA_SMALL_NUMBER)
+            {
+                continue;
+            }
+
+            const float Fraction = Portion / LayerThickness;
+            const float LayerHeatCapacity = GetLayerHeatCapacity(Snow, LayerIdx) * Fraction;
+            if (LayerHeatCapacity <= 0.0f)
+            {
+                continue;
+            }
+
+            CombinedHeatCapacity += LayerHeatCapacity;
+            WeightedEnergy += static_cast<double>(LayerHeatCapacity) * static_cast<double>(Snow.Temperature_K[LayerIdx]);
+            RemainingDepth -= Portion;
+        }
+
+        if (RemainingDepth > KINDA_SMALL_NUMBER && SoilHeatCapacityProfile.Num() > 0 && SoilThicknessProfile.Num() > 0)
+        {
+            const float SoilThickness = FMath::Max(static_cast<float>(SoilThicknessProfile[0]), MinimumLayerThickness_m);
+            const float Portion = FMath::Min(SoilThickness, RemainingDepth);
+            if (Portion > KINDA_SMALL_NUMBER)
+            {
+                const float Fraction = (SoilThickness > KINDA_SMALL_NUMBER) ? Portion / SoilThickness : 0.0f;
+                const float SoilHeatCapacity = static_cast<float>(SoilHeatCapacityProfile[0]) * Fraction;
+                if (SoilHeatCapacity > 0.0f)
+                {
+                    const float SoilTemp = Soil.Temperature_K[0];
+                    CombinedHeatCapacity += SoilHeatCapacity;
+                    WeightedEnergy += static_cast<double>(SoilHeatCapacity) * static_cast<double>(SoilTemp);
+                }
+            }
+        }
+
+        if (CombinedHeatCapacity > 0.0f)
+        {
+            HeatCapacity = FMath::Max(HeatCapacity, CombinedHeatCapacity);
+            if (Snow.Thickness_m[0] + KINDA_SMALL_NUMBER < SurfaceLayerThickness)
+            {
+                const float BlendedTemperature = static_cast<float>(WeightedEnergy / static_cast<double>(CombinedHeatCapacity));
+                InitialTemp = BlendedTemperature;
+            }
+        }
+    }
+
+    HeatCapacity = FMath::Max(HeatCapacity, MinHeatCapacity_Jm2K);
+
+    const float SpecificHeatAir = ModelParameters.PhysicalConstants.SpecificHeatAir_JkgK;
+    const float LatentVapour = ModelParameters.PhysicalConstants.LatentHeatVapor_Jkg;
+    const float RainHeatCapacity = ModelParameters.PhysicalConstants.RainHeatCapacity_Jkg;
+    constexpr float StefanBoltzmann = 5.670374419e-8f;
+    const float Emissivity = ModelParameters.Radiation.SnowEmissivity;
+    const float LatentFusion = ModelParameters.PhysicalConstants.LatentHeatFusion_Jkg;
+    const float SurfaceMoistureConductance = (Soil.LayerCount > 0)
+        ? ComputeSurfaceMoistureConductance(Soil)
+        : ModelParameters.Soil.SurfaceMoistureConductance_ms;
+
+    auto EvaluateFluxesInternal = [&](float SurfaceTemp, bool bLimitLatentHeat, float* OutWaterAvailability, float* OutSurfaceMoistureConductance) -> FFSM2EnergyFluxes
+    {
+        const float EffectiveTemp = bHasSnow ? FMath::Clamp(SurfaceTemp, MinSnowTempK, FreezePoint_K) : FMath::Max(SurfaceTemp, MinSnowTempK);
+        FFSM2EnergyFluxes Fluxes;
+        Fluxes.NetShortwave = NetShortwave;
+        Fluxes.NetLongwave = IncomingLongwave - Emissivity * StefanBoltzmann * FMath::Pow(EffectiveTemp, 4.0f);
+        const float Qs = CalcSpecificHumidity(EffectiveTemp, 1.0f, PressurePa);
+        const bool bSurfaceAtOrAboveFreezing = (EffectiveTemp >= FreezePoint_K - KelvinEpsilon);
+        const float SurfaceLatentHeat = bSurfaceAtOrAboveFreezing ? LatentVapour : (LatentVapour + LatentFusion);
+        float AerodynamicConductance = LegacyConductance;
+        if (!bHasCanopyExchange)
+        {
+            const float SnowFrac = FMath::Clamp(SnowCoverFraction, 0.0f, 1.0f);
+            const float RoughSnow = FMath::Max(ModelParameters.Snow.SnowRoughnessLength_m, MinRoughnessLength_m);
+            const float RoughBare = FMath::Max(ModelParameters.Soil.SnowFreeRoughnessLength_m, MinRoughnessLength_m);
+            const float WeightedLog = SnowFrac * FMath::Loge(RoughSnow) + (1.0f - SnowFrac) * FMath::Loge(RoughBare);
+            const float MomentumRoughness = FMath::Exp(WeightedLog);
+            const float ThermalRoughness = FMath::Max(0.1f * MomentumRoughness, MinRoughnessLength_m);
+            const float zU = FMath::Max(MeasurementWindHeight, MomentumRoughness + 1.0e-3f);
+            const float zT = FMath::Max(MeasurementTempHeight, ThermalRoughness + 1.0e-3f);
+
+            float UStar = VonKarman * EffectiveWindSpeed / FMath::Max(FMath::Loge(zU / MomentumRoughness), 1.0e-3f);
+            float Ga = VonKarman * UStar / FMath::Max(FMath::Loge(zT / ThermalRoughness), 1.0e-3f);
+            float Stability = 0.0f;
+
+            for (int32 Iter = 0; Iter < 10; ++Iter)
+            {
+                if (Iter < 8)
+                {
+                    const float Den = FMath::Max(UStar * UStar * UStar, 1.0e-6f);
+                    Stability = -VonKarman * Gravity * Ga * (EffectiveTemp - AirTempK) / (FMath::Max(AirTempK, 200.0f) * Den);
+                }
+
+                const float PsiMTop = StabilityPsiM(zU, Stability);
+                const float PsiMBot = StabilityPsiM(MomentumRoughness, Stability);
+                const float PsiHTop = StabilityPsiH(zT, Stability);
+                const float PsiHBot = StabilityPsiH(ThermalRoughness, Stability);
+
+                const float DenomM = FMath::Max(FMath::Loge(zU / MomentumRoughness) - (PsiMTop - PsiMBot), 1.0e-3f);
+                const float DenomH = FMath::Max(FMath::Loge(zT / ThermalRoughness) - (PsiHTop - PsiHBot), 1.0e-3f);
+
+                const float NewUStar = VonKarman * EffectiveWindSpeed / DenomM;
+                const float NewGa = VonKarman * NewUStar / DenomH;
+
+                if (!FMath::IsFinite(NewUStar) || !FMath::IsFinite(NewGa))
+                {
+                    break;
+                }
+
+                const float DeltaGa = FMath::Abs(NewGa - Ga);
+                UStar = FMath::Clamp(NewUStar, 1.0e-4f, 2.0f);
+                Ga = FMath::Clamp(NewGa, 1.0e-5f, 2.0f);
+
+                if (DeltaGa < 1.0e-5f)
+                {
+                    break;
+                }
+            }
+
+            AerodynamicConductance = FMath::Max(Ga, LegacyConductance);
+        }
+
+        Fluxes.Sensible = AirDensity * SpecificHeatAir * AerodynamicConductance * (EffectiveTemp - AirTempK);
+        const float LatentUnlim = AirDensity * SurfaceLatentHeat * AerodynamicConductance * (Qs - Qa);
+
+        // Apply moisture availability limitation (Fortran-style)
+        float WaterAvailability = 1.0f;
+        float SurfaceConductance = SurfaceMoistureConductance;
+
+        if (bLimitLatentHeat)
+        {
+            if (Qa > Qs + SaturationTolerance)
+            {
+                // Water available - use full conductance
+                WaterAvailability = 1.0f;
+            }
+            else
+            {
+                // Limited by surface moisture conductance
+                SurfaceConductance = SurfaceMoistureConductance;
+                const float Denom = SurfaceConductance + AerodynamicConductance;
+                WaterAvailability = (Denom > 0.0f)
+                    ? SnowCoverFraction + (1.0f - SnowCoverFraction) * (SurfaceConductance / Denom)
+                    : SnowCoverFraction;
+                WaterAvailability = FMath::Clamp(WaterAvailability, 0.0f, 1.0f);
+            }
+        }
+
+        Fluxes.Latent = LatentUnlim * WaterAvailability;
+
+        const float RainTargetTemperature = FreezePoint_K;
+        Fluxes.Rain = (DtSeconds > 0.0f) ? ThroughfallRain * RainHeatCapacity * (AirTempK - RainTargetTemperature) / DtSeconds : 0.0f;
+        LastAerodynamicConductance = AerodynamicConductance;
+        if (OutWaterAvailability)
+        {
+            *OutWaterAvailability = WaterAvailability;
+        }
+        if (OutSurfaceMoistureConductance)
+        {
+            *OutSurfaceMoistureConductance = SurfaceConductance;
+        }
+        return Fluxes;
+    };
+
+    auto EvaluateFluxes = [&](float SurfaceTemp, bool bLimitLatentHeat = true, float* OutWaterAvailability = nullptr, float* OutSurfaceConductance = nullptr) -> FFSM2EnergyFluxes
+    {
+        return EvaluateFluxesInternal(SurfaceTemp, bLimitLatentHeat, OutWaterAvailability, OutSurfaceConductance);
+    };
+
+    auto ApplyEnergy = [&](const FFSM2EnergyFluxes& Fluxes)
+    {
+        FFSM2SurfaceUpdate Update;
+        float Temperature = InitialTemp;
+        float Ice = InitialIce;
+        float Liquid = InitialLiquid;
+        float Energy = Fluxes.Total() * DtSeconds;
+        float MeltMass = 0.0f;
+        float ColumnIceAvailable = TotalColumnIceMass;
+
+        if (HeatCapacity <= MinHeatCapacity_Jm2K)
+        {
+            Temperature = bHasSnow ? FMath::Clamp(AirTempK, MinSnowTempK, FreezePoint_K) : AirTempK;
+            Energy = 0.0f;
+        }
+        else
+        {
+            if (Temperature < FreezePoint_K - KelvinEpsilon)
+            {
+                const float EnergyToWarm = (FreezePoint_K - Temperature) * HeatCapacity;
+                if (Energy >= EnergyToWarm)
+                {
+                    Temperature = FreezePoint_K;
+                    Energy -= EnergyToWarm;
+                }
+                else
+                {
+                    if (bHasSnow)
+                    {
+                        Temperature = FMath::Clamp(Temperature + Energy / HeatCapacity, MinSnowTempK, FreezePoint_K);
+                    }
+                    else
+                    {
+                        // BUGFIX: Bare ground must also have upper temperature limit
+                        Temperature = FMath::Clamp(Temperature + Energy / HeatCapacity, MinSnowTempK, 330.0f);
+                    }
+                    Energy = 0.0f;
+                }
+            }
+
+            ColumnIceAvailable = FMath::Max(ColumnIceAvailable, 0.0f);
+
+            if (Energy > 0.0f && ColumnIceAvailable > KINDA_SMALL_NUMBER)
+            {
+                const float PotentialMelt = Energy / LatentFusion;
+                const float ActualMelt = FMath::Min(PotentialMelt, ColumnIceAvailable);
+                if (ActualMelt > KINDA_SMALL_NUMBER)
+                {
+                    const float SurfaceMelt = FMath::Min(Ice, ActualMelt);
+                    if (SurfaceMelt > 0.0f)
+                    {
+                        Ice -= SurfaceMelt;
+                        Liquid += SurfaceMelt;
+                    }
+
+                    MeltMass += ActualMelt;
+                    Energy -= ActualMelt * LatentFusion;
+                    ColumnIceAvailable = FMath::Max(ColumnIceAvailable - ActualMelt, 0.0f);
+                }
+            }
+            if (FMath::Abs(Energy) > KINDA_SMALL_NUMBER)
+            {
+                if (bHasSnow || ColumnIceAvailable > KINDA_SMALL_NUMBER || Ice > KINDA_SMALL_NUMBER)
+                {
+                    Temperature = FMath::Clamp(Temperature + Energy / HeatCapacity, MinSnowTempK, FreezePoint_K);
+                }
+                else
+                {
+                    // BUGFIX: Bare ground must also have upper temperature limit
+                    Temperature = FMath::Clamp(Temperature + Energy / HeatCapacity, MinSnowTempK, 330.0f);
+                }
+            }
+        }
+
+        if (ThroughfallRain > KINDA_SMALL_NUMBER)
+        {
+            Liquid += ThroughfallRain;
+        }
+
+        if (bHasSnow || ColumnIceAvailable > KINDA_SMALL_NUMBER || Ice > KINDA_SMALL_NUMBER)
+        {
+            Update.TemperatureK = FMath::Clamp(Temperature, MinSnowTempK, FreezePoint_K);
+        }
+        else
+        {
+            // BUGFIX: Bare ground must also have upper temperature limit
+            Update.TemperatureK = FMath::Clamp(Temperature, MinSnowTempK, 330.0f);
+        }
+        Update.IceMass_kgm2 = FMath::Max(0.0f, Ice);
+        Update.LiquidMass_kgm2 = FMath::Max(0.0f, Liquid);
+        Update.MeltMass_kgm2 = MeltMass;
+        Update.RefreezeMass_kgm2 = 0.0f;
+
+        // Calculate surface mass flux from latent heat flux
+        // Latent flux is energy flux, convert to mass flux using appropriate latent heat
+        if (FMath::Abs(Fluxes.Latent) > KINDA_SMALL_NUMBER)
+        {
+            const float LatentHeat = (Update.TemperatureK > FreezePoint_K) ?
+                LatentVapour : // Evaporation
+                LatentVapour + LatentFusion; // Sublimation
+            Update.SurfaceMassFlux_kgm2s = Fluxes.Latent / LatentHeat;
+        }
+        else
+        {
+            Update.SurfaceMassFlux_kgm2s = 0.0f;
+        }
+
+        return Update;
+    };
+
+    // Fortran-style iterative solution for surface energy balance
+    float SurfaceTemp = InitialTemp;
+    const int32 MaxIterations = 10;
+    const float ResidualTolerance = 0.01f;
+    const float Rwat = ModelParameters.PhysicalConstants.GasConstantWaterVapour_JkgK;
+
+    // Log first few timesteps to diagnose 330K issue
+    static int32 StepCount = 0;
+    const bool bLogThisStep = (StepCount < 5);
+    if (bLogThisStep)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("=== Energy Balance Step %d ==="), StepCount);
+        UE_LOG(LogTemp, Warning, TEXT("  InitialTemp: %.2f K, bHasSnow: %d, GroundTemp: %.2f K"),
+            InitialTemp, bHasSnow, GroundTemperature);
+        UE_LOG(LogTemp, Warning, TEXT("  AirTemp: %.2f K, NetSW: %.2f W/m2, InLW: %.2f W/m2"),
+            AirTempK, NetShortwave, IncomingLongwave);
+        UE_LOG(LogTemp, Warning, TEXT("  HeatCapacity: %.2f J/m2K, DtSeconds: %.2f"),
+            HeatCapacity, DtSeconds);
+    }
+
+    FFSM2EnergyFluxes Fluxes = FFSM2EnergyFluxes();
+
+    for (int32 Iter = 0; Iter < MaxIterations; ++Iter)
+    {
+        float WaterAvailability = 1.0f;
+        float SurfaceConductance = SurfaceMoistureConductance;
+        Fluxes = EvaluateFluxesInternal(SurfaceTemp, true, &WaterAvailability, &SurfaceConductance);
+
+        const float IterTemp = bHasSnow ? FMath::Clamp(SurfaceTemp, MinSnowTempK, FreezePoint_K) : FMath::Max(SurfaceTemp, MinSnowTempK);
+        const bool bWithinBounds = bHasSnow ? (SurfaceTemp > MinSnowTempK + KelvinEpsilon && SurfaceTemp < FreezePoint_K - KelvinEpsilon) : true;
+        const float ClampDerivative = bHasSnow ? (bWithinBounds ? 1.0f : 0.0f) : 1.0f;
+
+        float GroundHeatFlux = 0.0f;
+        float GroundDerivative = 0.0f;
+        if (ModelParameters.Modules.bEnableGroundHeatFlux && SurfaceLayerThickness > KINDA_SMALL_NUMBER)
+        {
+            const float SurfaceConductivity = SurfaceLayerConductivity;
+            GroundHeatFlux = 2.0f * SurfaceConductivity * (IterTemp - SurfaceLayerTemperature) / SurfaceLayerThickness;
+            GroundDerivative = 2.0f * SurfaceConductivity / SurfaceLayerThickness * ClampDerivative;
+        }
+
+        const float QsIter = CalcSpecificHumidity(IterTemp, 1.0f, PressurePa);
+        const float EffectiveLatentHeat = (IterTemp >= FreezePoint_K - KelvinEpsilon)
+            ? LatentVapour
+            : LatentVapour + LatentFusion;
+        const float Dqs_dT = (IterTemp > 0.0f)
+            ? EffectiveLatentHeat * QsIter / (Rwat * IterTemp * IterTemp)
+            : 0.0f;
+
+        const FFSM2SurfaceUpdate IterUpdate = ApplyEnergy(Fluxes);
+        const float IterMeltEnergy_Wm2 = (DtSeconds > KINDA_SMALL_NUMBER)
+            ? IterUpdate.MeltMass_kgm2 * LatentFusion / DtSeconds
+            : 0.0f;
+
+        const float EnergyResidual = Fluxes.Total() - GroundHeatFlux - IterMeltEnergy_Wm2;
+        const float DEnergy_dT =
+            -4.0f * Emissivity * StefanBoltzmann * FMath::Pow(IterTemp, 3.0f) * ClampDerivative
+            - AirDensity * SpecificHeatAir * LastAerodynamicConductance * ClampDerivative
+            - AirDensity * EffectiveLatentHeat * LastAerodynamicConductance * WaterAvailability * Dqs_dT * ClampDerivative
+            - GroundDerivative;
+
+        if (bLogThisStep)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("    Iter %d: SurfTemp=%.2f K, Residual=%.2f W/m2, dE/dT=%.2f, H=%.2f, LE=%.2f, GFlux=%.2f"),
+                Iter, IterTemp, EnergyResidual, DEnergy_dT, Fluxes.Sensible, Fluxes.Latent, GroundHeatFlux);
+        }
+
+        if (FMath::Abs(EnergyResidual) < ResidualTolerance || FMath::Abs(DEnergy_dT) < KINDA_SMALL_NUMBER)
+        {
+            SurfaceTemp = IterTemp;
+            if (bLogThisStep)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("    Converged at iter %d"), Iter);
+            }
+            break;
+        }
+
+        float TempIncrement = -EnergyResidual / DEnergy_dT;
+        TempIncrement = FMath::Clamp(TempIncrement, -40.0f, 40.0f);
+        if (bHasSnow)
+        {
+            SurfaceTemp = FMath::Clamp(SurfaceTemp + TempIncrement, MinSnowTempK, FreezePoint_K);
+        }
+        else
+        {
+            // BUGFIX: Bare ground must also have upper temperature limit to prevent solver divergence
+            SurfaceTemp = FMath::Clamp(SurfaceTemp + TempIncrement, MinSnowTempK, 330.0f);
+        }
+    }
+
+    if (bLogThisStep)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("  Final SurfaceTemp: %.2f K"), SurfaceTemp);
+        StepCount++;
+    }
+
+    if (bHasSnow)
+    {
+        SurfaceTemp = FMath::Clamp(SurfaceTemp, MinSnowTempK, FreezePoint_K);
+    }
+    else
+    {
+        SurfaceTemp = FMath::Max(SurfaceTemp, MinSnowTempK);
+    }
+
+    // Final fluxes at converged surface temperature
+    float FinalWaterAvailability = 1.0f;
+    float FinalSurfaceConductance = SurfaceMoistureConductance;
+    Fluxes = EvaluateFluxes(SurfaceTemp, true, &FinalWaterAvailability, &FinalSurfaceConductance);
+    FFSM2SurfaceUpdate Update = ApplyEnergy(Fluxes);
+
+    auto ResolveEffectiveSurfaceTemp = [&](const FFSM2SurfaceUpdate& SurfaceUpdate) -> float
+    {
+        if (bHasSnow)
+        {
+            return FMath::Clamp(SurfaceUpdate.TemperatureK, MinSnowTempK, FreezePoint_K);
+        }
+        // BUGFIX: Bare ground must also have upper temperature limit
+        return FMath::Clamp(SurfaceUpdate.TemperatureK, MinSnowTempK, 330.0f);
+    };
+
+    float EffectiveTempFinal = ResolveEffectiveSurfaceTemp(Update);
+
+    if (FMath::Abs(EffectiveTempFinal - SurfaceTemp) > 1.0e-3f)
+    {
+        SurfaceTemp = EffectiveTempFinal;
+        FinalWaterAvailability = 1.0f;
+        FinalSurfaceConductance = SurfaceMoistureConductance;
+        Fluxes = EvaluateFluxes(SurfaceTemp, true, &FinalWaterAvailability, &FinalSurfaceConductance);
+        Update = ApplyEnergy(Fluxes);
+        EffectiveTempFinal = ResolveEffectiveSurfaceTemp(Update);
+    }
+    else
+    {
+        SurfaceTemp = EffectiveTempFinal;
+    }
+
+    float FinalGroundHeatFlux_Wm2 = 0.0f;
+    if (SurfaceLayerThickness > KINDA_SMALL_NUMBER)
+    {
+        FinalGroundHeatFlux_Wm2 = 2.0f * SurfaceLayerConductivity * (EffectiveTempFinal - SurfaceLayerTemperature) / SurfaceLayerThickness;
+    }
+
+    float MeltEnergy_Wm2 = (DtSeconds > KINDA_SMALL_NUMBER)
+        ? Update.MeltMass_kgm2 * LatentFusion / DtSeconds
+        : 0.0f;
+    float EnergyResidual_Wm2 = Fluxes.Total() - FinalGroundHeatFlux_Wm2 - MeltEnergy_Wm2;
+
+    // Mirror FSM2's "all snow melts" trial step: if residual energy remains while snow is present,
+    // spend it on additional melt before pushing the imbalance into the ground heat flux.
+    if (DtSeconds > KINDA_SMALL_NUMBER && EnergyResidual_Wm2 > ResidualTolerance)
+    {
+        const float IceRemaining = FMath::Max(0.0f, TotalColumnIceMass - Update.MeltMass_kgm2);
+        if (IceRemaining > KINDA_SMALL_NUMBER)
+        {
+            const float ResidualEnergy_Jm2 = EnergyResidual_Wm2 * DtSeconds;
+            const float AdditionalMelt = FMath::Min(ResidualEnergy_Jm2 / LatentFusion, IceRemaining);
+            if (AdditionalMelt > KINDA_SMALL_NUMBER)
+            {
+                Update.MeltMass_kgm2 += AdditionalMelt;
+
+                const float SurfaceMelt = FMath::Min(Update.IceMass_kgm2, AdditionalMelt);
+                if (SurfaceMelt > KINDA_SMALL_NUMBER)
+                {
+                    Update.IceMass_kgm2 = FMath::Max(0.0f, Update.IceMass_kgm2 - SurfaceMelt);
+                }
+                Update.LiquidMass_kgm2 += AdditionalMelt;
+
+                MeltEnergy_Wm2 += AdditionalMelt * LatentFusion / DtSeconds;
+                EnergyResidual_Wm2 = Fluxes.Total() - FinalGroundHeatFlux_Wm2 - MeltEnergy_Wm2;
+            }
+        }
+    }
+
+    if (FMath::Abs(EnergyResidual_Wm2) > ResidualTolerance)
+    {
+        FinalGroundHeatFlux_Wm2 += EnergyResidual_Wm2;
+    }
+
+    OutFluxes = Fluxes;
+    OutSurfaceUpdate = Update;
+    OutSurfaceTemperatureK = Update.TemperatureK;
+
+    OutSurfaceMoistureConductance_ms = FinalSurfaceConductance;
+    OutSurfaceMoistureAvailability = FinalWaterAvailability;
+    return FinalGroundHeatFlux_Wm2;
+}
+
+float UFSM2SnowSimulation::ComputeSnowDepthMeters(const FFSM2SnowColumn& Snow) const
+{
+    float Depth = 0.0f;
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        Depth += Snow.Thickness_m[LayerIdx];
+    }
+    return Depth;
+}
+
+float UFSM2SnowSimulation::ComputeSnowMass(const FFSM2SnowColumn& Snow) const
+{
+    float Mass = 0.0f;
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        Mass += Snow.IceMass_kgm2[LayerIdx] + Snow.LiquidMass_kgm2[LayerIdx];
+    }
+    return Mass;
+}
+
+float UFSM2SnowSimulation::ComputeSnowIceMass(const FFSM2SnowColumn& Snow) const
+{
+    float Mass = 0.0f;
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        Mass += FMath::Max(0.0f, Snow.IceMass_kgm2[LayerIdx]);
+    }
+    return Mass;
+}
+
+void UFSM2SnowSimulation::EnsureDiagnosticsFileInitialized()
+{
+    if (bDiagnosticsFileInitialized)
+    {
+        return;
+    }
+
+    // Create diagnostics directory if it doesn't exist
+    FString DiagnosticsDir = FPaths::ProjectDir() / ModelParameters.Diagnostics.DiagnosticsDirectory;
+    IFileManager::Get().MakeDirectory(*DiagnosticsDir, true);
+
+    // Generate unique filename with timestamp
+    FDateTime Now = FDateTime::Now();
+    FString Timestamp = FString::Printf(TEXT("%04d%02d%02d_%02d%02d%02d"),
+        Now.GetYear(), Now.GetMonth(), Now.GetDay(),
+        Now.GetHour(), Now.GetMinute(), Now.GetSecond());
+
+    DiagnosticsFilePath = DiagnosticsDir / FString::Printf(TEXT("FSM2Diagnostics_%s.csv"), *Timestamp);
+
+    bDiagnosticsFileInitialized = true;
+}
+
+void UFSM2SnowSimulation::WriteDiagnostics(const TArray<FFSM2CellDiagnostics>& CellDiagnostics)
+{
+    if (!bDiagnosticsFileInitialized || CellDiagnostics.Num() == 0)
+    {
+        return;
+    }
+
+    FString Output;
+
+    // Write header if not already written
+    if (!bDiagnosticsHeaderWritten)
+    {
+        FString Header = TEXT("Step,CellIndex,TimeSeconds,DateTimeISO,SnowDepth_m,SnowMass_kgm2,Runoff_kgm2,ThroughfallSnow_kgm2,ThroughfallRain_kgm2,FrostMass_kgm2,MeltMass_kgm2,RefreezeMass_kgm2,SublimationMass_kgm2,CanopySnow_kgm2,CanopyLiquid_kgm2,SurfaceTemperatureK,NetSurfaceFlux_Wm2,GroundHeatFlux_Wm2,ForcingAirTemperatureK,ForcingIncomingLongwave_Wm2,ForcingIncomingShortwave_Wm2,ForcingDiffuseShortwave_Wm2,ForcingDirectShortwave_Wm2,ForcingWindSpeed_mps,SurfaceMoistureConductance_ms,SurfaceMoistureAvailability,");
+        Header += TEXT("Fluxes.NetShortwave,Fluxes.NetLongwave,Fluxes.Sensible,Fluxes.Latent,Fluxes.Rain,");
+        Header += TEXT("SnowLayerCount,SoilLayerCount,");
+
+        // Snow layer columns
+        for (int32 i = 0; i < GFSM2MaxLayers; ++i)
+        {
+            Header += FString::Printf(TEXT("SnowThickness_m[%d],SnowTemperature_K[%d],SnowIceMass_kgm2[%d],SnowLiquidMass_kgm2[%d],SnowDensity_kgm3[%d],SnowGrainRadius_m[%d],"), i, i, i, i, i, i);
+        }
+
+        // Soil layer columns
+        for (int32 i = 0; i < GFSM2MaxSoilLayers; ++i)
+        {
+            Header += FString::Printf(TEXT("SoilThickness_m[%d],SoilTemperature_K[%d],SoilMoisture_Vol[%d],"), i, i, i);
+        }
+
+        Header.RemoveFromEnd(TEXT(","));
+        Output += Header + TEXT("\n");
+        bDiagnosticsHeaderWritten = true;
+    }
+
+    // Write data rows
+    for (const FFSM2CellDiagnostics& Diag : CellDiagnostics)
+    {
+        const FString TimestampString = Diag.Timestamp.ToIso8601();
+        const int32 SnowCount = FMath::Clamp(Diag.SnowLayerCount, 0, GFSM2MaxLayers);
+        const int32 SoilCount = FMath::Clamp(Diag.SoilLayerCount, 0, GFSM2MaxSoilLayers);
+
+        auto SanitizeFloat = [](float Value) -> FString
+        {
+            return FString::SanitizeFloat(Value);
+        };
+
+        TArray<FString> Fields;
+        Fields.Reserve(25 + GFSM2MaxLayers * 6 + GFSM2MaxSoilLayers * 3);
+
+        Fields.Add(FString::FromInt(Diag.StepIndex));
+        Fields.Add(FString::FromInt(Diag.CellIndex));
+        Fields.Add(FString::SanitizeFloat(Diag.SimulationTimeSeconds));
+        Fields.Add(TimestampString);
+        Fields.Add(SanitizeFloat(Diag.SnowDepth_m));
+        Fields.Add(SanitizeFloat(Diag.SnowMass_kgm2));
+        Fields.Add(SanitizeFloat(Diag.Runoff_kgm2));
+        Fields.Add(SanitizeFloat(Diag.ThroughfallSnow_kgm2));
+        Fields.Add(SanitizeFloat(Diag.ThroughfallRain_kgm2));
+        Fields.Add(SanitizeFloat(Diag.FrostMass_kgm2));
+        Fields.Add(SanitizeFloat(Diag.MeltMass_kgm2));
+        Fields.Add(SanitizeFloat(Diag.RefreezeMass_kgm2));
+        Fields.Add(SanitizeFloat(Diag.SublimationMass_kgm2));
+        Fields.Add(SanitizeFloat(Diag.CanopySnow_kgm2));
+        Fields.Add(SanitizeFloat(Diag.CanopyLiquid_kgm2));
+        Fields.Add(SanitizeFloat(Diag.SurfaceTemperatureK));
+        Fields.Add(SanitizeFloat(Diag.NetSurfaceFlux_Wm2));
+        Fields.Add(SanitizeFloat(Diag.GroundHeatFlux_Wm2));
+        Fields.Add(SanitizeFloat(Diag.ForcingAirTemperatureK));
+        Fields.Add(SanitizeFloat(Diag.ForcingIncomingLongwave_Wm2));
+        Fields.Add(SanitizeFloat(Diag.ForcingIncomingShortwave_Wm2));
+        Fields.Add(SanitizeFloat(Diag.ForcingDiffuseShortwave_Wm2));
+        Fields.Add(SanitizeFloat(Diag.ForcingDirectShortwave_Wm2));
+        Fields.Add(SanitizeFloat(Diag.ForcingWindSpeed_mps));
+        Fields.Add(SanitizeFloat(Diag.SurfaceMoistureConductance_ms));
+        Fields.Add(SanitizeFloat(Diag.SurfaceMoistureAvailability));
+        Fields.Add(SanitizeFloat(Diag.Fluxes.NetShortwave));
+        Fields.Add(SanitizeFloat(Diag.Fluxes.NetLongwave));
+        Fields.Add(SanitizeFloat(Diag.Fluxes.Sensible));
+        Fields.Add(SanitizeFloat(Diag.Fluxes.Latent));
+        Fields.Add(SanitizeFloat(Diag.Fluxes.Rain));
+
+        Fields.Add(FString::FromInt(SnowCount));
+        Fields.Add(FString::FromInt(SoilCount));
+
+        for (int32 i = 0; i < GFSM2MaxLayers; ++i)
+        {
+            if (i < SnowCount)
+            {
+                Fields.Add(SanitizeFloat(Diag.SnowThickness_m[i]));
+                Fields.Add(SanitizeFloat(Diag.SnowTemperature_K[i]));
+                Fields.Add(SanitizeFloat(Diag.SnowIceMass_kgm2[i]));
+                Fields.Add(SanitizeFloat(Diag.SnowLiquidMass_kgm2[i]));
+                Fields.Add(SanitizeFloat(Diag.SnowDensity_kgm3[i]));
+                Fields.Add(SanitizeFloat(Diag.SnowGrainRadius_m[i]));
+            }
+            else
+            {
+                Fields.Add(TEXT("nan"));
+                Fields.Add(TEXT("nan"));
+                Fields.Add(TEXT("nan"));
+                Fields.Add(TEXT("nan"));
+                Fields.Add(TEXT("nan"));
+                Fields.Add(TEXT("nan"));
+            }
+        }
+
+        for (int32 i = 0; i < GFSM2MaxSoilLayers; ++i)
+        {
+            if (i < SoilCount)
+            {
+                Fields.Add(SanitizeFloat(Diag.SoilThickness_m[i]));
+                Fields.Add(SanitizeFloat(Diag.SoilTemperature_K[i]));
+                Fields.Add(SanitizeFloat(Diag.SoilMoisture_Vol[i]));
+            }
+            else
+            {
+                Fields.Add(TEXT("nan"));
+                Fields.Add(TEXT("nan"));
+                Fields.Add(TEXT("nan"));
+            }
+        }
+
+        FString Line = FString::Join(Fields, TEXT(","));
+        Output += Line;
+        Output.AppendChar(TEXT('\n'));
+    }
+
+    const uint32 WriteFlags = ModelParameters.Diagnostics.bAppendDiagnostics ? FILEWRITE_Append : FILEWRITE_None;
+    FFileHelper::SaveStringToFile(Output, *DiagnosticsFilePath, FFileHelper::EEncodingOptions::AutoDetect, &IFileManager::Get(), WriteFlags);
+}
+
+void UFSM2SnowSimulation::SolveTridiagonal(int32 Count, double* a, double* b, double* c, double* rhs, double* x) const
+{
+    if (Count <= 0 || !a || !b || !c || !rhs || !x)
+    {
+        return;
+    }
+
+    // Forward sweep
+    for (int32 i = 1; i < Count; ++i)
+    {
+        const double m = a[i] / b[i - 1];
+        b[i] -= m * c[i - 1];
+        rhs[i] -= m * rhs[i - 1];
+    }
+
+    // Back substitution
+    x[Count - 1] = rhs[Count - 1] / b[Count - 1];
+    for (int32 i = Count - 2; i >= 0; --i)
+    {
+        x[i] = (rhs[i] - c[i] * x[i + 1]) / b[i];
+    }
+}
+
+void UFSM2SnowSimulation::PartitionShortwave(const FWeatherForcingData& Forcing, float IncomingSW, float& OutDiffuse, float& OutDirect) const
+{
+    OutDiffuse = IncomingSW;
+    OutDirect = 0.0f;
+
+    if (ModelParameters.Atmosphere.ShortwavePartition != EFSM2ShortwavePartition::DiffuseAndDirect || IncomingSW <= KINDA_SMALL_NUMBER)
+    {
+        return;
+    }
+
+    const float LatitudeDeg = bHasEnvironmentalOverride ? CachedLatitudeDeg : ModelParameters.Atmosphere.LatitudeDegrees;
+    const float LatitudeRad = FMath::DegreesToRadians(LatitudeDeg);
+    const int32 DayOfYear = Forcing.Timestamp.GetDayOfYear();
+    const float HourLocal = Forcing.Timestamp.GetHour() + Forcing.Timestamp.GetMinute() / 60.0f + Forcing.Timestamp.GetSecond() / 3600.0f;
+    const float Declination = 0.409f * FMath::Sin(2.0f * PI * (static_cast<float>(DayOfYear) - 81.0f) / 368.0f);
+    const float SolarNoon = bHasEnvironmentalOverride ? CachedSolarNoon : ModelParameters.Atmosphere.SolarNoonLocalTime;
+    const float HourAngle = 15.0f * (HourLocal - SolarNoon);
+    const float HourAngleRad = FMath::DegreesToRadians(HourAngle);
+    const float Elevation = FMath::Asin(FMath::Sin(LatitudeRad) * FMath::Sin(Declination) + FMath::Cos(LatitudeRad) * FMath::Cos(Declination) * FMath::Cos(HourAngleRad));
+    const float CosZenith = FMath::Max(0.0f, FMath::Sin(Elevation));
+    const float ClearSky = ModelParameters.PhysicalConstants.SolarConstant_Wm2 * FMath::Max(CosZenith, 0.05f);
+    const float Kt = FMath::Clamp(IncomingSW / FMath::Max(ClearSky, 1.0f), 0.0f, 2.0f);
+
+    float DiffuseFraction = 1.0f;
+    if (Kt <= 0.22f)
+    {
+        DiffuseFraction = 1.0f - 0.09f * Kt;
+    }
+    else if (Kt <= 0.8f)
+    {
+        DiffuseFraction = 0.9511f - 0.1604f * Kt + 4.388f * FMath::Square(Kt) - 16.638f * FMath::Pow(Kt, 3.0f) + 12.336f * FMath::Pow(Kt, 4.0f);
+    }
+    else
+    {
+        DiffuseFraction = 0.165f;
+    }
+
+    DiffuseFraction = FMath::Clamp(DiffuseFraction, 0.0f, 1.0f);
+    OutDiffuse = DiffuseFraction * IncomingSW;
+    OutDirect = IncomingSW - OutDiffuse;
+}
+
+float UFSM2SnowSimulation::UpdateSnowAlbedo(FFSM2ColumnState& Column, float DtSeconds, float SurfaceTemperatureK, float SnowfallRate_kgm2s) const
+{
+    const float Fresh = FMath::Clamp(ModelParameters.Radiation.FreshSnowAlbedo, 0.0f, 0.98f);
+    const float Old = FMath::Clamp(ModelParameters.Radiation.OldSnowAlbedo, 0.0f, Fresh);
+    const float MinAlbedo = FMath::Clamp(ModelParameters.Snow.MinimumSnowAlbedo, 0.0f, Fresh);
+    const float MaxAlbedo = FMath::Clamp(ModelParameters.Snow.MaximumSnowAlbedo, MinAlbedo, 0.98f);
+
+    float& Albedo = Column.SnowAlbedo;
+
+    if (Column.Snow.LayerCount == 0)
+    {
+        Albedo = Old;
+        return Albedo;
+    }
+
+    switch (ModelParameters.Snow.AlbedoScheme)
+    {
+    case EFSM2AlbedoScheme::DiagnosticTemperature:
+    {
+        const float Talb_K = ModelParameters.PhysicalConstants.MeltingPoint_K + ModelParameters.Snow.AlbedoDecayTemperature_C;
+        const float Ratio = FMath::Clamp((SurfaceTemperatureK - ModelParameters.PhysicalConstants.MeltingPoint_K) / FMath::Max(Talb_K - ModelParameters.PhysicalConstants.MeltingPoint_K, 1.0f), 0.0f, 1.0f);
+        Albedo = FMath::Lerp(MaxAlbedo, MinAlbedo, Ratio);
+        break;
+    }
+
+    case EFSM2AlbedoScheme::PrognosticAge:
+    {
+        const float TauCold = FMath::Max(ModelParameters.Snow.ColdSnowAlbedoTimescale_s, 1.0f);
+        const float TauMelt = FMath::Max(ModelParameters.Snow.MeltSnowAlbedoTimescale_s, 1.0f);
+        const float Tau = (SurfaceTemperatureK < FreezePoint_K) ? TauCold : TauMelt;
+        const float ReciprocalTau = (Tau > KINDA_SMALL_NUMBER) ? 1.0f / Tau : 0.0f;
+        const float RefreshMass = FMath::Max(ModelParameters.Snow.SnowfallRefreshAlbedo_kgm2, KINDA_SMALL_NUMBER);
+        const float SnowTerm = FMath::Max(SnowfallRate_kgm2s, 0.0f) / RefreshMass;
+        const float DecayRate = ReciprocalTau + SnowTerm;
+        if (DecayRate > KINDA_SMALL_NUMBER)
+        {
+            const float LimitingAlbedo = FMath::Clamp((MinAlbedo * ReciprocalTau + MaxAlbedo * SnowTerm) / DecayRate, MinAlbedo, MaxAlbedo);
+            const float Decay = (DtSeconds > 0.0f) ? FMath::Exp(-DecayRate * DtSeconds) : 1.0f;
+            Albedo = LimitingAlbedo + (Albedo - LimitingAlbedo) * Decay;
+        }
+        else
+        {
+            Albedo = FMath::Clamp(Albedo, MinAlbedo, MaxAlbedo);
+        }
+        break;
+    }
+
+
+
+
+
+
+
+    default:
+        Albedo = Old;
+        break;
+    }
+
+    Albedo = FMath::Clamp(Albedo, MinAlbedo, MaxAlbedo);
+    return Albedo;
+}
+
+float UFSM2SnowSimulation::ComputeSnowCoverFraction(const FFSM2SnowColumn& Snow) const
+{
+    float Depth = 0.0f;
+    for (int32 LayerIdx = 0; LayerIdx < Snow.LayerCount; ++LayerIdx)
+    {
+        Depth += Snow.Thickness_m[LayerIdx];
+    }
+
+    const float Scale = FMath::Max(ModelParameters.Snow.SnowCoverFractionDepthScale_m, KINDA_SMALL_NUMBER);
+
+    switch (ModelParameters.Snow.SnowCoverFractionScheme)
+    {
+    case EFSM2SnowFractionScheme::Linear:
+        return FMath::Clamp(Depth / Scale, 0.0f, 1.0f);
+
+    case EFSM2SnowFractionScheme::HyperbolicTangent:
+        return FMath::Clamp(FMath::Tanh(Depth / Scale), 0.0f, 1.0f);
+
+    case EFSM2SnowFractionScheme::Asymptotic:
+        return Depth / (Depth + Scale);
+
+    default:
+        return FMath::Clamp(Depth / Scale, 0.0f, 1.0f);
+    }
+}
+
+float UFSM2SnowSimulation::ComputeSurfaceAlbedo(const FFSM2ColumnState& Column, float SnowAlbedo, float SnowCoverFraction) const
+{
+    const float GroundAlbedo = FMath::Clamp(ModelParameters.Radiation.GroundAlbedo, 0.0f, 1.0f);
+    const float Weighted = GroundAlbedo * (1.0f - SnowCoverFraction) + SnowAlbedo * SnowCoverFraction;
+    return FMath::Clamp(Weighted, 0.0f, 1.0f);
+}
+
+void UFSM2SnowSimulation::AdjustMeasurementHeights(float& WindHeight, float& TempHeight) const
+{
+    if (ModelParameters.Atmosphere.MeasurementHeightReference == EFSM2HeightReference::AboveCanopyTop && ModelParameters.Vegetation.CanopyHeight_m > 0.0f)
+    {
+        const float Offset = ModelParameters.Vegetation.CanopyHeight_m;
+        WindHeight += Offset;
+        TempHeight += Offset;
+    }
+}
+
+float UFSM2SnowSimulation::ResolveBulkTransferCoefficient(float WindHeight, float TempHeight) const
+{
+    const float Reference = FMath::Max(ModelParameters.Atmosphere.BulkTransferCoefficient, 1.0e-5f);
+    const float RefWind = FMath::Max(ModelParameters.Atmosphere.WindMeasurementHeight_m, 0.1f);
+    const float RefTemp = FMath::Max(ModelParameters.Atmosphere.TemperatureMeasurementHeight_m, 0.1f);
+    const float EffectiveWind = FMath::Max(WindHeight, 0.1f);
+    const float EffectiveTemp = FMath::Max(TempHeight, 0.1f);
+
+    const float HeightFactor = FMath::Sqrt((RefWind * RefTemp) / FMath::Max(EffectiveWind * EffectiveTemp, 0.01f));
+    return FMath::Clamp(Reference * HeightFactor, 1.0e-5f, 5.0e-3f);
+}
+
+void UFSM2SnowSimulation::RefreshEnvironmentalMetadata(UWorld* World)
+{
+    bHasEnvironmentalOverride = false;
+
+    if (!World)
+    {
+        return;
+    }
+
+    if (AGeoReferencingSystem* Geo = AGeoReferencingSystem::GetGeoReferencingSystem(World))
+    {
+        double Lat = Geo->OriginLatitude;
+        if (Geo->bOriginLocationInProjectedCRS)
+        {
+            FGeographicCoordinates GeoCoords;
+            Geo->ProjectedToGeographic(FVector(Geo->OriginProjectedCoordinatesEasting, Geo->OriginProjectedCoordinatesNorthing, Geo->OriginProjectedCoordinatesUp), GeoCoords);
+            Lat = GeoCoords.Latitude;
+        }
+
+        CachedLatitudeDeg = static_cast<float>(Lat);
+        CachedSolarNoon = ModelParameters.Atmosphere.SolarNoonLocalTime;
+        bHasEnvironmentalOverride = true;
+    }
+
+    // Use model parameters for solar noon time
+    // TODO: Optionally integrate with SunSky plugin if available in future
+    if (bHasEnvironmentalOverride)
+    {
+        CachedSolarNoon = ModelParameters.Atmosphere.SolarNoonLocalTime;
+    }
+
+    if (bHasEnvironmentalOverride)
+    {
+        ModelParameters.Atmosphere.LatitudeDegrees = CachedLatitudeDeg;
+        ModelParameters.Atmosphere.SolarNoonLocalTime = CachedSolarNoon;
+    }
+}
+
+void UFSM2SnowSimulation::ComputeSnowConduction(FFSM2SnowColumn& Snow, FFSM2SoilColumn& Soil, float DtSeconds, float SurfaceFlux_Wm2, double& OutGsoil_Wm2)
+{
+    const int32 SnowCount = FMath::Clamp(Snow.LayerCount, 0, GFSM2MaxLayers);
+    const int32 SoilCount = FMath::Clamp(Soil.LayerCount, 0, GFSM2MaxSoilLayers);
+
+    OutGsoil_Wm2 = 0.0;
+
+    if (SnowCount <= 0)
+    {
+        return;
+    }
+
+    TStaticArray<double, GFSM2MaxLayers> csnow;
+    TStaticArray<double, GFSM2MaxLayers> ksnow;
+    TStaticArray<double, GFSM2MaxLayers> thickness;
+
+    for (int32 LayerIdx = 0; LayerIdx < SnowCount; ++LayerIdx)
+    {
+        const double HeatCapacity = Snow.IceMass_kgm2[LayerIdx] * ModelParameters.PhysicalConstants.SpecificHeatIce_JkgK +
+            Snow.LiquidMass_kgm2[LayerIdx] * ModelParameters.PhysicalConstants.SpecificHeatWater_JkgK;
+        csnow[LayerIdx] = FMath::Max<double>(HeatCapacity, MinHeatCapacity_Jm2K);
+        ksnow[LayerIdx] = FMath::Max<double>(GetLayerThermalConductivity(Snow, LayerIdx), 1.0e-3);
+        thickness[LayerIdx] = FMath::Max<double>(Snow.Thickness_m[LayerIdx], MinimumLayerThickness_m);
+    }
+
+    const double SoilTemperature = (SoilCount > 0) ? Soil.Temperature_K[0] : ModelParameters.Soil.GroundTemperature_K;
+    const double SoilThickness = (SoilCount > 0)
+        ? FMath::Max<double>(Soil.Thickness_m[0], MinimumLayerThickness_m)
+        : ((ModelParameters.Layers.SoilLayerThicknesses_m.Num() > 0)
+            ? FMath::Max<double>(ModelParameters.Layers.SoilLayerThicknesses_m[0], MinimumLayerThickness_m)
+            : MinimumLayerThickness_m);
+
+    // Get soil thermal conductivity using moisture-dependent calculation
+    double SoilConductivity = ModelParameters.Soil.GroundConductivity_WmK;
+    if (SoilCount > 0)
+    {
+        TArray<double> SoilThicknessArray, SoilConductivityArray, SoilHeatCapacityArray;
+        EvaluateSoilThermalProfile(Soil, SoilThicknessArray, SoilConductivityArray, SoilHeatCapacityArray);
+        if (SoilConductivityArray.Num() > 0)
+        {
+            SoilConductivity = FMath::Max<double>(SoilConductivityArray[0], 1.0e-3);
+        }
+    }
+
+    const double Dt = FMath::Max<double>(DtSeconds, KINDA_SMALL_NUMBER);
+    const double MinSnowTempK = static_cast<double>(ModelParameters.Snow.MinSnowTemperature_K);
+    const double FreezePointSnowK = static_cast<double>(FreezePoint_K);
+
+    if (SnowCount == 1)
+    {
+        const double SnowSoilResistance = (thickness[0] / ksnow[0]) + (SoilThickness / SoilConductivity);
+        const double USoil = (SnowSoilResistance > KINDA_SMALL_NUMBER) ? (2.0 / SnowSoilResistance) : 0.0;
+
+        const double Numerator = (SurfaceFlux_Wm2 + USoil * (SoilTemperature - Snow.Temperature_K[0])) * Dt;
+        const double Denominator = csnow[0] + USoil * Dt;
+        const double dT = (Denominator > KINDA_SMALL_NUMBER) ? Numerator / Denominator : 0.0;
+
+        double NewTemp = Snow.Temperature_K[0] + dT;
+        const bool bLayerHasSnow = Snow.IceMass_kgm2[0] > KINDA_SMALL_NUMBER || Snow.LiquidMass_kgm2[0] > KINDA_SMALL_NUMBER;
+        if (bLayerHasSnow)
+        {
+            NewTemp = FMath::Clamp(NewTemp, MinSnowTempK, FreezePointSnowK);
+        }
+        else
+        {
+            NewTemp = FMath::Max(NewTemp, MinSnowTempK);
+        }
+        Snow.Temperature_K[0] = static_cast<float>(NewTemp);
+        OutGsoil_Wm2 = USoil * (Snow.Temperature_K[0] - SoilTemperature);
+        return;
+    }
+
+    TStaticArray<double, GFSM2MaxLayers> UBetween;
+    for (int32 LayerIdx = 0; LayerIdx < SnowCount - 1; ++LayerIdx)
+    {
+        const double Resistance = (thickness[LayerIdx] / ksnow[LayerIdx]) + (thickness[LayerIdx + 1] / ksnow[LayerIdx + 1]);
+        UBetween[LayerIdx] = (Resistance > KINDA_SMALL_NUMBER) ? (2.0 / Resistance) : 0.0;
+    }
+
+    const double BottomResistance = (thickness[SnowCount - 1] / ksnow[SnowCount - 1]) + (SoilThickness / SoilConductivity);
+    const double UBottom = (BottomResistance > KINDA_SMALL_NUMBER) ? (2.0 / BottomResistance) : 0.0;
+
+    TStaticArray<double, GFSM2MaxLayers> a;
+    TStaticArray<double, GFSM2MaxLayers> b;
+    TStaticArray<double, GFSM2MaxLayers> c;
+    TStaticArray<double, GFSM2MaxLayers> rhs;
+    TStaticArray<double, GFSM2MaxLayers> dT;
+
+    for (int32 LayerIdx = 0; LayerIdx < SnowCount; ++LayerIdx)
+    {
+        if (LayerIdx == 0)
+        {
+            const double UBelow = UBetween[0];
+            a[LayerIdx] = 0.0;
+            b[LayerIdx] = csnow[LayerIdx] + UBelow * Dt;
+            c[LayerIdx] = -UBelow * Dt;
+            rhs[LayerIdx] = (SurfaceFlux_Wm2 - UBelow * (Snow.Temperature_K[LayerIdx] - Snow.Temperature_K[LayerIdx + 1])) * Dt;
+        }
+        else if (LayerIdx < SnowCount - 1)
+        {
+            const double UAbove = UBetween[LayerIdx - 1];
+            const double UBelow = UBetween[LayerIdx];
+            a[LayerIdx] = c[LayerIdx - 1];
+            b[LayerIdx] = csnow[LayerIdx] + (UAbove + UBelow) * Dt;
+            c[LayerIdx] = -UBelow * Dt;
+            rhs[LayerIdx] = (UAbove * (Snow.Temperature_K[LayerIdx - 1] - Snow.Temperature_K[LayerIdx]) +
+                UBelow * (Snow.Temperature_K[LayerIdx + 1] - Snow.Temperature_K[LayerIdx])) * Dt;
+        }
+        else
+        {
+            const double UAbove = UBetween[LayerIdx - 1];
+            a[LayerIdx] = c[LayerIdx - 1];
+            b[LayerIdx] = csnow[LayerIdx] + (UAbove + UBottom) * Dt;
+            c[LayerIdx] = 0.0;
+            rhs[LayerIdx] = (UAbove * (Snow.Temperature_K[LayerIdx - 1] - Snow.Temperature_K[LayerIdx]) +
+                UBottom * (SoilTemperature - Snow.Temperature_K[LayerIdx])) * Dt;
+        }
+    }
+
+    SolveTridiagonal(SnowCount, a.GetData(), b.GetData(), c.GetData(), rhs.GetData(), dT.GetData());
+
+    for (int32 LayerIdx = 0; LayerIdx < SnowCount; ++LayerIdx)
+    {
+        double NewTemp = Snow.Temperature_K[LayerIdx] + dT[LayerIdx];
+        const bool bLayerHasSnow = Snow.IceMass_kgm2[LayerIdx] > KINDA_SMALL_NUMBER || Snow.LiquidMass_kgm2[LayerIdx] > KINDA_SMALL_NUMBER;
+        if (bLayerHasSnow)
+        {
+            NewTemp = FMath::Clamp(NewTemp, MinSnowTempK, FreezePointSnowK);
+        }
+        else
+        {
+            NewTemp = FMath::Max(NewTemp, MinSnowTempK);
+        }
+        Snow.Temperature_K[LayerIdx] = static_cast<float>(NewTemp);
+    }
+
+    OutGsoil_Wm2 = UBottom * (Snow.Temperature_K[SnowCount - 1] - SoilTemperature);
+}
+
+void UFSM2SnowSimulation::AdvanceSoilColumn(FFSM2SoilColumn& Soil, float DtSeconds, double Gsoil_Wm2)
+{
+    const int32 SoilCount = FMath::Clamp(Soil.LayerCount, 0, GFSM2MaxSoilLayers);
+    if (SoilCount <= 0 || DtSeconds <= 0.0f)
+    {
+        return;
+    }
+
+    // Use the complex soil thermal profile calculation
+    TArray<double> Thickness, Conductivity, HeatCapacity;
+    EvaluateSoilThermalProfile(Soil, Thickness, Conductivity, HeatCapacity);
+
+    const double Dt = FMath::Max<double>(DtSeconds, KINDA_SMALL_NUMBER);
+
+    if (SoilCount == 1)
+    {
+        const double UBottom = Conductivity[0] / FMath::Max<double>(Thickness[0], MinimumLayerThickness_m);
+        const double Denominator = HeatCapacity[0] + UBottom * Dt;
+        const double dT = (Denominator > KINDA_SMALL_NUMBER) ? (Gsoil_Wm2 * Dt) / Denominator : 0.0;
+        Soil.Temperature_K[0] = FMath::Clamp<double>(Soil.Temperature_K[0] + dT, 200.0, 330.0);
+        return;
+    }
+
+    TStaticArray<double, GFSM2MaxSoilLayers> UBetween;
+    for (int32 SoilIdx = 0; SoilIdx < SoilCount - 1; ++SoilIdx)
+    {
+        const double Resistance = (Thickness[SoilIdx] / Conductivity[SoilIdx]) + (Thickness[SoilIdx + 1] / Conductivity[SoilIdx + 1]);
+        UBetween[SoilIdx] = (Resistance > KINDA_SMALL_NUMBER) ? (2.0 / Resistance) : 0.0;
+    }
+
+    const double UBottom = Conductivity[SoilCount - 1] / FMath::Max<double>(Thickness[SoilCount - 1], MinimumLayerThickness_m);
+
+    TStaticArray<double, GFSM2MaxSoilLayers> a;
+    TStaticArray<double, GFSM2MaxSoilLayers> b;
+    TStaticArray<double, GFSM2MaxSoilLayers> c;
+    TStaticArray<double, GFSM2MaxSoilLayers> rhs;
+    TStaticArray<double, GFSM2MaxSoilLayers> dT;
+
+    for (int32 SoilIdx = 0; SoilIdx < SoilCount; ++SoilIdx)
+    {
+        if (SoilIdx == 0)
+        {
+            const double UBelow = UBetween[0];
+            a[SoilIdx] = 0.0;
+            b[SoilIdx] = HeatCapacity[SoilIdx] + UBelow * Dt;
+            c[SoilIdx] = -UBelow * Dt;
+            rhs[SoilIdx] = (Gsoil_Wm2 - UBelow * (Soil.Temperature_K[SoilIdx] - Soil.Temperature_K[SoilIdx + 1])) * Dt;
+        }
+        else if (SoilIdx < SoilCount - 1)
+        {
+            const double UAbove = UBetween[SoilIdx - 1];
+            const double UBelow = UBetween[SoilIdx];
+            a[SoilIdx] = c[SoilIdx - 1];
+            b[SoilIdx] = HeatCapacity[SoilIdx] + (UAbove + UBelow) * Dt;
+            c[SoilIdx] = -UBelow * Dt;
+            rhs[SoilIdx] = (UAbove * (Soil.Temperature_K[SoilIdx - 1] - Soil.Temperature_K[SoilIdx]) +
+                UBelow * (Soil.Temperature_K[SoilIdx + 1] - Soil.Temperature_K[SoilIdx])) * Dt;
+        }
+        else
+        {
+            const double UAbove = UBetween[SoilIdx - 1];
+            a[SoilIdx] = c[SoilIdx - 1];
+            b[SoilIdx] = HeatCapacity[SoilIdx] + (UAbove + UBottom) * Dt;
+            c[SoilIdx] = 0.0;
+            rhs[SoilIdx] = (UAbove * (Soil.Temperature_K[SoilIdx - 1] - Soil.Temperature_K[SoilIdx])) * Dt;
+        }
+    }
+
+    SolveTridiagonal(SoilCount, a.GetData(), b.GetData(), c.GetData(), rhs.GetData(), dT.GetData());
+
+    for (int32 SoilIdx = 0; SoilIdx < SoilCount; ++SoilIdx)
+    {
+        Soil.Temperature_K[SoilIdx] = FMath::Clamp<double>(Soil.Temperature_K[SoilIdx] + dT[SoilIdx], 200.0, 330.0);
+    }
+}

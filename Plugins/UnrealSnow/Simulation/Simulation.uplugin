@@ -1,0 +1,20 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "Snow Simulation",
+    "Description": "Snow simulation runtime module",
+    "Category": "Programming Rendering.Plugins",
+    "CreatedBy": "UnrealSnow",
+    "CreatedByURL": "",
+    "CanContainContent": false,
+    "EnabledByDefault": true,
+    "IsBetaVersion": false,
+    "Modules": [
+        {
+            "Name": "Simulation",
+            "Type": "Runtime",
+            "LoadingPhase": "PostConfigInit"
+        }
+    ]
+}

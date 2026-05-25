@@ -1,0 +1,129 @@
+// Radiation Index Computation Shader
+// Computes dimensionless radiation fields using reference patch normalization:
+//   r_dir(x,y)  = RTY_Direct(x,y) / (R_direct + epsilon)
+//   r_diff(x,y) = RTY_Diffuse(x,y) / (R_diffuse + epsilon)
+
+#include "/Engine/Public/Platform.ush"
+
+// Small epsilon for safe division (prevents divide-by-zero)
+static const float DIVISION_EPSILON = 1e-6;
+
+// Input textures (R16f single-channel luminance)
+Texture2D<float> RTY_Direct;
+Texture2D<float> RTY_Diffuse;
+
+// Sun visibility scalar (0-1). 0 when sun is below configured threshold.
+float SunVisibility;
+
+// Output textures (R16f single-channel dimensionless indices)
+RWTexture2D<float> RTF_DirIndex;
+RWTexture2D<float> RTF_DiffIndex;
+
+// Shader parameters
+uint2 TextureDimensions;          // Width and height of textures
+float ReferenceMean_Direct;       // R_direct: mean from reference patch (y=0)
+float ReferenceMean_Diffuse;      // R_diffuse: mean from reference patch (y=0)
+uint BorderRows;                  // Number of border rows (top edge)
+
+// =============================================================================
+// Compute Radiation Indices (Dimensionless Fields)
+// =============================================================================
+
+[numthreads(8, 8, 1)]
+void ComputeRadiationIndexCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    // Early out if thread is outside texture bounds
+    if (ThreadId.x >= TextureDimensions.x || ThreadId.y >= TextureDimensions.y)
+    {
+        return;
+    }
+
+    // Skip reference border rows (y < BorderRows)
+    // Reference patch should not be normalized (it IS the reference)
+    if (ThreadId.y < BorderRows)
+    {
+        // Reference patch: Set indices to 1.0 (by definition, reference = 1.0)
+        RTF_DirIndex[ThreadId.xy] = 1.0;
+        RTF_DiffIndex[ThreadId.xy] = 1.0;
+        return;
+    }
+
+    // Read luminance values from input textures
+    float DirectLuminance = RTY_Direct[ThreadId.xy];
+    float DiffuseLuminance = RTY_Diffuse[ThreadId.xy];
+
+    // Compute dimensionless radiation indices
+    // r_dir  = L_direct / R_direct
+    // r_diff = L_diffuse / R_diffuse
+    //
+    // Epsilon prevents division by zero (e.g., nighttime or heavily shadowed reference)
+    float DirectIndex = DirectLuminance / (ReferenceMean_Direct + DIVISION_EPSILON);
+    float DiffuseIndex = DiffuseLuminance / (ReferenceMean_Diffuse + DIVISION_EPSILON);
+
+    // Zero-out indices when the sun is below the configured visibility threshold
+    DirectIndex *= SunVisibility;
+    DiffuseIndex *= SunVisibility;
+
+    // Write dimensionless indices to output
+    RTF_DirIndex[ThreadId.xy] = DirectIndex;
+    RTF_DiffIndex[ThreadId.xy] = DiffuseIndex;
+}
+
+// =============================================================================
+// GPU Mean Calculation - Horizontal Reduction (Reference Patch)
+// =============================================================================
+// This shader computes the mean of the reference patch (y=0 row) using
+// parallel reduction. Each thread reduces a portion of the row, then
+// writes to a partial sum buffer for final CPU accumulation.
+
+// Partial sum output buffer (one element per thread group in X dimension)
+RWStructuredBuffer<float> PartialSums_Direct;
+RWStructuredBuffer<float> PartialSums_Diffuse;
+
+groupshared float SharedSums_Direct[64];   // 8x8 = 64 threads per group
+groupshared float SharedSums_Diffuse[64];
+
+[numthreads(8, 8, 1)]
+void ComputeReferenceMeanCS(uint3 ThreadId : SV_DispatchThreadID,
+                            uint3 GroupThreadId : SV_GroupThreadID,
+                            uint3 GroupId : SV_GroupID)
+{
+    uint LocalIndex = GroupThreadId.y * 8 + GroupThreadId.x;
+
+    // Only process y=0 (reference row)
+    // Other threads in Y dimension contribute zero
+    float DirectValue = 0.0;
+    float DiffuseValue = 0.0;
+
+    if (ThreadId.y == 0 && ThreadId.x < TextureDimensions.x)
+    {
+        DirectValue = RTY_Direct[uint2(ThreadId.x, 0)];
+        DiffuseValue = RTY_Diffuse[uint2(ThreadId.x, 0)];
+    }
+
+    // Store to shared memory
+    SharedSums_Direct[LocalIndex] = DirectValue;
+    SharedSums_Diffuse[LocalIndex] = DiffuseValue;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Parallel reduction within thread group (64 threads → 1 sum)
+    [unroll]
+    for (uint s = 32; s > 0; s >>= 1)
+    {
+        if (LocalIndex < s)
+        {
+            SharedSums_Direct[LocalIndex] += SharedSums_Direct[LocalIndex + s];
+            SharedSums_Diffuse[LocalIndex] += SharedSums_Diffuse[LocalIndex + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Thread 0 writes group sum to partial buffer
+    if (LocalIndex == 0)
+    {
+        uint GroupIndex = GroupId.x;  // One partial sum per X group
+        PartialSums_Direct[GroupIndex] = SharedSums_Direct[0];
+        PartialSums_Diffuse[GroupIndex] = SharedSums_Diffuse[0];
+    }
+}

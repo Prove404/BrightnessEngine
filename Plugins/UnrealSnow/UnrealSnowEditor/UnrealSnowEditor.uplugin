@@ -1,0 +1,26 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "Snow Simulation Editor Tools",
+    "Description": "Editor tools for snow simulation including Frost weather data fetching",
+    "Category": "Programming Rendering.Plugins",
+    "CreatedBy": "UnrealSnow",
+    "CreatedByURL": "",
+    "CanContainContent": false,
+    "EnabledByDefault": true,
+    "IsBetaVersion": false,
+    "Modules": [
+        {
+            "Name": "UnrealSnowEditor",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "SimulationData",
+            "Enabled": true
+        }
+    ]
+}

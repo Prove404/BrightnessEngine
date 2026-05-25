@@ -1,0 +1,8 @@
+#include "/Engine/Public/Platform.ush"
+
+[numthreads(THREADGROUP_SIZE_X, THREADGROUP_SIZE_Y, 1)]
+void GeometryRayTracingPlaceholderCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    // Placeholder only. The real full-scene SVF/SWdir GPU backend will switch
+    // to scene-aware ray generation once the RDG ray-tracing pass is wired.
+}

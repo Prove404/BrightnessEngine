@@ -1,0 +1,40 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/RayTracing/RayTracingCommon.ush"
+
+RaytracingAccelerationStructure TLAS;
+StructuredBuffer<FBasicRayData> Rays;
+RWStructuredBuffer<uint> OcclusionOutput;
+
+RAY_TRACING_ENTRY_RAYGEN(GeometryOcclusionShadowMaskRGS)
+{
+	const uint RayIndex = DispatchRaysIndex().x;
+	FBasicRayData InputRay = Rays[RayIndex];
+
+	RayDesc Ray;
+	Ray.Origin = InputRay.Origin;
+	Ray.Direction = InputRay.Direction;
+	Ray.TMin = 0.0f;
+	Ray.TMax = InputRay.TFar;
+
+	const uint RayFlags = 0
+		| RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH
+		| RAY_FLAG_FORCE_OPAQUE
+		| RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+	const uint InstanceInclusionMask = InputRay.Mask;
+
+	FDefaultPayload Payload = (FDefaultPayload)0;
+
+	TraceRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		RAY_TRACING_SHADER_SLOT_MATERIAL,
+		RAY_TRACING_NUM_SHADER_SLOTS,
+		0,
+		Ray,
+		Payload
+	);
+
+	OcclusionOutput[RayIndex] = ((FMinimalPayload)Payload).IsHit() ? ~0 : 0;
+}

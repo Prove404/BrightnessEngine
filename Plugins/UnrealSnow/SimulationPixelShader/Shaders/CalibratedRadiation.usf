@@ -1,0 +1,49 @@
+// Calibrated Radiation Compute Shader
+// Scales UE luminance buffers into physical irradiance and calibrated indices.
+
+#include "/Engine/Public/Platform.ush"
+
+// Small epsilon to avoid divide-by-zero
+static const float GHI_EPSILON = 1e-6;
+
+// Inputs (R16f single-channel luminance)
+Texture2D<float> RTY_Direct;
+Texture2D<float> RTY_Diffuse;
+
+// Outputs
+RWTexture2D<float> RTF_Etot;     // R32f irradiance (W/m^2)
+RWTexture2D<float> RTF_rUE_cal;  // R16f calibrated index (dimensionless)
+
+// Parameters
+uint2 TextureDimensions;
+float DirectScale;
+float DiffuseScale;
+float InvGlobalIrradiance;
+
+[numthreads(8, 8, 1)]
+void CalibratedRadiationCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    if (ThreadId.x >= TextureDimensions.x || ThreadId.y >= TextureDimensions.y)
+    {
+        return;
+    }
+
+    const uint2 Pixel = ThreadId.xy;
+
+    // Fetch luminance contributions
+    const float DirectLuminance = RTY_Direct[Pixel];
+    const float DiffuseLuminance = RTY_Diffuse[Pixel];
+
+    // Scale to physical irradiance
+    const float E_dir = DirectScale * DirectLuminance;
+    const float E_diff = DiffuseScale * DiffuseLuminance;
+    const float E_tot = E_dir + E_diff;
+
+    // Write irradiance (W/m^2) to R32f UAV
+    RTF_Etot[Pixel] = E_tot;
+
+    // Convert to calibrated dimensionless index
+    const float SafeInvGHI = InvGlobalIrradiance > 0.0 ? InvGlobalIrradiance : 1.0 / GHI_EPSILON;
+    const float rUE = E_tot * SafeInvGHI;
+    RTF_rUE_cal[Pixel] = rUE;
+}

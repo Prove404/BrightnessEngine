@@ -1,0 +1,71 @@
+# Unreal Engine
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+cesium-request-cache.sqlite
+cesium-request-cache.sqlite-shm
+cesium-request-cache.sqlite-wal
+Alpine3D/
+analysis_results/
+artifacts/
+Data_Forward_Scattering/
+doc/
+FSM2-master/
+HORAYZON/
+HPEval/
+Scripts/
+thesis/
+tools/
+DEM/
+.vscode/
+.vs/
+*.sln
+*.opensdf
+*.suo
+*.sdf
+*.pdb
+*.log
+*.db
+*.ipch
+*.tmp
+*.obj
+*.exe
+*.dll
+
+# Build
+Build/
+
+# Ignore user settings
+*.user
+*.userprefs
+*.swp
+
+# Exclude vehicle template files (UE template, not needed in repository)
+Content/VehicleTemplate/
+Content/Vehicles/
+Content/Brushify/
+Content/Fab/
+Content/__ExternalActors__/VehicleTemplate/
+Content/__ExternalObjects__/VehicleTemplate/
+
+# Exclude third-party source directories
+UnrealSnow-master/
+CryoGridCommunity_source-master/
+
+
+.claude/settings.local.json
+
+# Windows special files
+nul
+
+# Local tooling and recovery artifacts
+.codex/
+.claude/
+.tmp/
+.git.broken-*/
+.History/
+__pycache__/
+*.backup
+StepSimulation*
+.agents/skills/run-horayzon/third_party/hmm/

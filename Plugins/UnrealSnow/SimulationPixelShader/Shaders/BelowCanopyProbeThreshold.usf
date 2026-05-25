@@ -1,0 +1,34 @@
+// BelowCanopyProbeThreshold.usf
+//
+// Pass 2 of the single-capture HPEval sky-mask pipeline.
+// Reduces the per-group statistics from BelowCanopyProbeFaceStats into a single
+// sky-luminance threshold written to OutThreshold[0].
+//
+// InStats[i] = float2(maxLuminance, sumPositive) per group.
+//
+// threshold = globalMax * SkyMaxFraction
+//
+// SkyMaxFraction ~ 0.50: sky pixels are always the brightest values in the scene.
+// Anchoring to the global max works correctly in both open-sky (sky dominates) and
+// below-canopy (terrain dominates) scenes — the max is always a sky pixel, so 50%
+// of that sits above terrain and below the sky cluster.
+// Single-thread dispatch (1,1,1) — NumStats is at most ~(64×64)/64 = 64 groups.
+
+#include "/Engine/Public/Platform.ush"
+
+StructuredBuffer<float2>  InStats;       // float2(maxLuminance, sumPositive) per group
+RWStructuredBuffer<float> OutThreshold;  // [0] = computed threshold
+
+uint  NumStats;
+float ThresholdFraction;  // SkyMaxFraction, default 0.50
+
+[numthreads(1, 1, 1)]
+void BelowCanopyProbeThresholdCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	float GlobalMax = 0.0f;
+	for (uint i = 0; i < NumStats; ++i)
+	{
+		GlobalMax = max(GlobalMax, InStats[i].x);
+	}
+	OutThreshold[0] = (GlobalMax > 0.0f) ? GlobalMax * ThresholdFraction : 0.0f;
+}

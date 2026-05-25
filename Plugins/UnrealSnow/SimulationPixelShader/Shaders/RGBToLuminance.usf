@@ -1,0 +1,42 @@
+// RGB to Scalar Conversion Compute Shader
+// Collapses RGBA16f render targets to a single-channel broadband scalar using equal
+// channel weights. This is NOT a photopic luminance: BT.709 weights (0.2126/0.7152/0.0722)
+// bias green ~10x over blue, which is a human-vision weighting. For a shortwave-radiation
+// surrogate the three sampled bands should be treated as equally-weighted tristimulus
+// samples so that cell-to-cell spectral mix variation does not leak into the scalar.
+// Input:  RT_Total, RT_Direct (RGBA16f)
+// Output: RTY_Total, RTY_Direct (R16f - single channel)
+
+#include "/Engine/Public/Platform.ush"
+
+// Equal tristimulus weights: Y = (R + G + B) / 3
+static const float3 LuminanceWeights = float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0);
+
+// Input textures (RGBA16f)
+Texture2D<float4> InputTexture;
+
+// Output texture (R16f - single channel)
+RWTexture2D<float> OutputTexture;
+
+// Shader parameters
+uint2 TextureDimensions;  // Width and height of input/output textures
+
+[numthreads(8, 8, 1)]
+void RGBToLuminanceCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    // Early out if thread is outside texture bounds
+    if (ThreadId.x >= TextureDimensions.x || ThreadId.y >= TextureDimensions.y)
+    {
+        return;
+    }
+
+    // Read RGB color from input texture
+    float4 RGBAColor = InputTexture[ThreadId.xy];
+
+    // Collapse RGB to scalar using equal channel weights (broadband tristimulus mean).
+    // Y = (R + G + B) / 3
+    float Luminance = dot(RGBAColor.rgb, LuminanceWeights);
+
+    // Write single-channel luminance to output
+    OutputTexture[ThreadId.xy] = Luminance;
+}

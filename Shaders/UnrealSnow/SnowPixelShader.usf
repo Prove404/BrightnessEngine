@@ -1,0 +1,35 @@
+#include "/Engine/Public/Platform.ush"
+#define UINT_FLOAT_SCALE 100000.0f
+
+// Parameters (automatically bound by UE5 parameter struct system)
+int ClimateDataDimension;
+int CellsDimensionX;
+int CellsDimensionY;
+StructuredBuffer<float> SnowInputBuffer;
+StructuredBuffer<uint> MaxSnowInputBuffer;
+
+void MainVS(
+	float4 InPosition : ATTRIBUTE0,
+	float2 InUV : ATTRIBUTE1,
+	out float2 OutUV : TEXCOORD0,
+	out float4 OutPosition : SV_POSITION
+	)
+{
+	OutPosition = InPosition;
+	OutUV = InUV;
+}
+
+void MainPS(
+	in float2 uv : TEXCOORD0,
+	in uint instanceId : SV_InstanceID,
+	out float4 OutColor : SV_Target0
+	)
+{
+	int2 coord = int2(uv.x, uv.y);
+	int snowBufferIndex = coord.x + CellsDimensionX * coord.y;
+	float maxSnow = (float)MaxSnowInputBuffer[0] / UINT_FLOAT_SCALE;
+
+	float snowAmount = (float)SnowInputBuffer[snowBufferIndex] / maxSnow;
+
+	OutColor = float4(snowAmount, snowAmount, snowAmount, 1);
+}

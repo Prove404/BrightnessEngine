@@ -1,0 +1,20 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "0.0.1",
+    "FriendlyName": "Shader Utility",
+    "Description": "Shader utility functions for snow simulation",
+    "Category": "Rendering",
+    "CreatedBy": "UnrealSnow",
+    "CreatedByURL": "",
+    "CanContainContent": false,
+    "EnabledByDefault": true,
+    "IsBetaVersion": false,
+    "Modules": [
+        {
+            "Name": "ShaderUtility",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        }
+    ]
+}

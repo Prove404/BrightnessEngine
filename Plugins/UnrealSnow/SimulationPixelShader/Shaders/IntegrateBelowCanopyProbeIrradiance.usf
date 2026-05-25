@@ -1,0 +1,111 @@
+// IntegrateBelowCanopyProbeIrradiance.usf
+//
+// Pass 3 of the single-capture HPEval sky-mask pipeline.
+// Cosine-weighted hemisphere irradiance integration for below-canopy probe faces.
+//
+// SkyThresholdBuffer[0] is written by BelowCanopyProbeThreshold.usf in the same
+// RDG graph, so no CPU roundtrip and no re-capture is needed.
+// When bUseSkyMask == 0, sky masking is disabled and TerrainPartialSums == PartialSums.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float4>          InputTexture;
+StructuredBuffer<float>    SkyThresholdBuffer;    // [0] = threshold from Pass 2; 0 = disabled
+RWStructuredBuffer<float>  PartialSums;           // total cosine-weighted irradiance (all pixels)
+RWStructuredBuffer<float>  TerrainPartialSums;    // terrain-only: sky pixels zeroed
+RWStructuredBuffer<float>  SkyFractionPartialSums; // cosine-weighted sky pixel weight
+
+uint2 TextureDimensions;
+uint  NumThreadGroupsX;
+float HorizontalFovDegrees;
+float FaceForwardX;
+float FaceForwardY;
+float FaceForwardZ;
+float FaceUpX;
+float FaceUpY;
+float FaceUpZ;
+float ReceiverNormalX;
+float ReceiverNormalY;
+float ReceiverNormalZ;
+uint  bUseSkyMask;  // 1 = read SkyThresholdBuffer; 0 = no masking
+
+groupshared float SharedSums[64];
+groupshared float SharedTerrainSums[64];
+groupshared float SharedSkyWeights[64];
+
+[numthreads(THREADGROUP_SIZE_X, THREADGROUP_SIZE_Y, 1)]
+void BelowCanopyProbeIntegrateCS(
+	uint3 ThreadId      : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 GroupId       : SV_GroupID)
+{
+	const uint LocalIndex = GroupThreadId.y * THREADGROUP_SIZE_X + GroupThreadId.x;
+
+	float Contribution   = 0.0f;
+	float TerrainContrib = 0.0f;
+	float SkyWeight      = 0.0f;
+
+	if (ThreadId.x < TextureDimensions.x && ThreadId.y < TextureDimensions.y)
+	{
+		const float TanHalfFov = tan(radians(max(1.0f, HorizontalFovDegrees) * 0.5f));
+		const float Du = (2.0f * TanHalfFov) / max(1.0f, (float)TextureDimensions.x);
+		const float Dv = (2.0f * TanHalfFov) / max(1.0f, (float)TextureDimensions.y);
+		const float V  = (1.0f - (2.0f * (((float)ThreadId.y + 0.5f) / (float)TextureDimensions.y))) * TanHalfFov;
+		const float U  = (((2.0f * ((float)ThreadId.x + 0.5f)) / (float)TextureDimensions.x) - 1.0f) * TanHalfFov;
+
+		const float3 Forward        = normalize(float3(FaceForwardX, FaceForwardY, FaceForwardZ));
+		const float3 Up             = normalize(float3(FaceUpX, FaceUpY, FaceUpZ));
+		const float3 ReceiverNormal = normalize(float3(ReceiverNormalX, ReceiverNormalY, ReceiverNormalZ));
+		const float3 Right          = normalize(cross(Up, Forward));
+		const float3 RayDirection   = normalize(Forward + Right * U + Up * V);
+		const float  CosTheta       = dot(RayDirection, ReceiverNormal);
+
+		if (CosTheta > 0.0f)
+		{
+			const float  SolidAngle = (Du * Dv) / pow(1.0f + U * U + V * V, 1.5f);
+			const float3 Color      = InputTexture[ThreadId.xy].rgb;
+			// Equal tristimulus weights (not BT.709 photopic) — see RGBToLuminance.usf.
+			const float  Luminance  = dot(Color, float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f));
+
+			Contribution = Luminance * CosTheta * SolidAngle;
+
+			if (bUseSkyMask != 0u)
+			{
+				const float Threshold = SkyThresholdBuffer[0];
+				const bool  bIsSky    = (Threshold > 0.0f) && (Luminance > Threshold);
+				TerrainContrib = bIsSky ? 0.0f : Contribution;
+				SkyWeight      = bIsSky ? (CosTheta * SolidAngle) : 0.0f;
+			}
+			else
+			{
+				TerrainContrib = Contribution;
+				SkyWeight      = 0.0f;
+			}
+		}
+	}
+
+	SharedSums[LocalIndex]        = Contribution;
+	SharedTerrainSums[LocalIndex] = TerrainContrib;
+	SharedSkyWeights[LocalIndex]  = SkyWeight;
+	GroupMemoryBarrierWithGroupSync();
+
+	[unroll]
+	for (uint Stride = 32; Stride > 0; Stride >>= 1)
+	{
+		if (LocalIndex < Stride)
+		{
+			SharedSums[LocalIndex]        += SharedSums[LocalIndex + Stride];
+			SharedTerrainSums[LocalIndex] += SharedTerrainSums[LocalIndex + Stride];
+			SharedSkyWeights[LocalIndex]  += SharedSkyWeights[LocalIndex + Stride];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	if (LocalIndex == 0)
+	{
+		const uint GroupIndex = GroupId.y * NumThreadGroupsX + GroupId.x;
+		PartialSums[GroupIndex]            = SharedSums[0];
+		TerrainPartialSums[GroupIndex]     = SharedTerrainSums[0];
+		SkyFractionPartialSums[GroupIndex] = SharedSkyWeights[0];
+	}
+}

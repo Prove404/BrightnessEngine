@@ -1,0 +1,706 @@
+#include "DegreeDaySimulation.h"
+#include "SnowSimulationActor.h"
+#include "SimulationComputeShader.h"
+#include "SimulationPixelShader.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Kismet/KismetRenderingLibrary.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "HAL/PlatformFileManager.h"
+#include "ClimateData.h"
+
+void UDegreeDaySimulation::Initialize_Implementation(int32 GX, int32 GY, float CellM)
+{
+	Super::Initialize_Implementation(GX, GY, CellM);
+}
+
+FString UDegreeDaySimulation::GetSimulationName() const
+{
+	return TEXT("DegreeDay");
+}
+
+void UDegreeDaySimulation::Initialize(ASnowSimulationActor* SimulationActor, const TArray<FLandscapeCell>& Cells, float InitialMaxSnow, UWorld* World)
+{
+	if (!SimulationActor) return;
+
+	const int32 DimX = SimulationActor->CellsDimensionX;
+	const int32 DimY = SimulationActor->CellsDimensionY;
+	InitializeGrid(DimX, DimY, 1.0f);
+
+	// Set terrain metadata for degree-day calculations
+	SetTerrainMetadata(Cells, DimX, DimY);
+
+	OwningSimulationActor = SimulationActor;
+	MeasurementAltitudeCm = (SimulationActor->ClimateDataComponent) ? SimulationActor->ClimateDataComponent->GetMeasurementAltitude() : 0.0f;
+
+	LegacyClimateData.Reset();
+	if (SimulationActor->ClimateDataComponent)
+	{
+		if (auto* RawClimate = SimulationActor->ClimateDataComponent->CreateRawClimateDataResourceArray(
+			SimulationActor->GetRunStartTime(), SimulationActor->GetRunEndTime()))
+		{
+			LegacyClimateData.Reserve(RawClimate->Num());
+			for (const FClimateData& Entry : *RawClimate)
+			{
+				LegacyClimateData.Add(Entry);
+			}
+			delete RawClimate;
+		}
+	}
+
+	InitializeCellState(Cells);
+	UpdateDepthFromSnowWaterEquivalent();
+}
+
+UTexture* UDegreeDaySimulation::GetSnowMapTexture()
+{
+	return Super::GetSnowMapTexture();
+}
+
+float UDegreeDaySimulation::GetMaxSnow()
+{
+	if (CurrentMaxSnowMM <= 0.0f)
+	{
+		float LocalMax = 0.0f;
+		for (const float V : DepthMeters)
+		{
+			LocalMax = FMath::Max(LocalMax, V);
+		}
+		CurrentMaxSnowMM = LocalMax * 1000.0f;
+	}
+	return CurrentMaxSnowMM;
+}
+
+void UDegreeDaySimulation::Step(float DtSeconds, const FWeatherForcingData& W, TArray<float>& OutDepthMeters)
+{
+	if (DepthMeters.Num() == 0 || DtSeconds <= 0.0f)
+	{
+		return;
+	}
+
+	ASnowSimulationActor* Actor = OwningSimulationActor.Get();
+	float LocalMeasurementAltitude = MeasurementAltitudeCm;
+	int32 DayOfYear = 172; // reasonable default (June solstice) if actor not available
+
+	if (Actor)
+	{
+		if (Actor->ClimateDataComponent)
+		{
+			LocalMeasurementAltitude = Actor->ClimateDataComponent->GetMeasurementAltitude();
+		}
+		DayOfYear = Actor->CurrentSimulationTime.GetDayOfYear();
+	}
+	else
+	{
+		DayOfYear = FDateTime::Now().GetDayOfYear();
+	}
+
+	PerformDegreeDayStep(DtSeconds, W, DayOfYear, LocalMeasurementAltitude);
+
+	// Ensure the caller sees the updated depth buffer even if they did not pass DepthMeters
+	if (&OutDepthMeters != &DepthMeters)
+	{
+		OutDepthMeters = DepthMeters;
+	}
+}
+
+void UDegreeDaySimulation::InitializeCellState(const TArray<FLandscapeCell>& Cells)
+{
+	const int32 CellCount = Cells.Num();
+	if (CellCount <= 0)
+	{
+		CellAreaSqMeters.Reset();
+		return;
+	}
+
+	const float OldSnowAlbedo = FMath::Clamp(SnowAlbedo, 0.0f, 1.0f);
+	const float FreshSnowAlbedo = 0.8f;
+
+	CellAreaSqMeters.SetNum(CellCount, EAllowShrinking::No);
+	CellAreaXYSqMeters.SetNum(CellCount, EAllowShrinking::No);
+	CellAltitudeCm.SetNum(CellCount, EAllowShrinking::No);
+	CellAspectRad.SetNum(CellCount, EAllowShrinking::No);
+	CellInclinationRad.SetNum(CellCount, EAllowShrinking::No);
+	CellLatitudeRad.SetNum(CellCount, EAllowShrinking::No);
+	CellSnowWaterEquivalentLiters.SetNum(CellCount, EAllowShrinking::No);
+	CellInterpolatedSWE_Liters.SetNum(CellCount, EAllowShrinking::No);
+	CellSnowAlbedoState.SetNum(CellCount, EAllowShrinking::No);
+	CellDaysSinceSnowfall.SetNum(CellCount, EAllowShrinking::No);
+	CellLastRadiationIndex.SetNum(CellCount, EAllowShrinking::No);
+	CellLastAccumulationDepth_m.SetNum(CellCount, EAllowShrinking::No);
+	CellLastMeltDepth_m.SetNum(CellCount, EAllowShrinking::No);
+	CellLastMeltFactor.SetNum(CellCount, EAllowShrinking::No);
+	CellLastLocalAirTempC.SetNum(CellCount, EAllowShrinking::No);
+	CellLastSlopeFiltered.SetNum(CellCount, EAllowShrinking::No);
+
+	for (int32 Idx = 0; Idx < CellCount; ++Idx)
+	{
+		const FLandscapeCell& Cell = Cells[Idx];
+
+		const float AreaSqMeters = Cell.Area / (100.0f * 100.0f);
+		const float AreaXYSqMeters = Cell.AreaXY / (100.0f * 100.0f);
+
+		CellAreaSqMeters[Idx] = AreaSqMeters;
+		CellAreaXYSqMeters[Idx] = AreaXYSqMeters;
+		CellAltitudeCm[Idx] = Cell.Centroid.Z;
+		CellAspectRad[Idx] = Cell.Aspect;
+		CellInclinationRad[Idx] = Cell.Inclination;
+		CellLatitudeRad[Idx] = Cell.Latitude;
+
+		const float InitialSWE = FMath::Max(0.0f, Cell.InitialWaterEquivalent);
+		CellSnowWaterEquivalentLiters[Idx] = InitialSWE;
+		CellInterpolatedSWE_Liters[Idx] = InitialSWE;
+		CellSnowAlbedoState[Idx] = (InitialSWE > 0.0f) ? FreshSnowAlbedo : OldSnowAlbedo;
+		CellDaysSinceSnowfall[Idx] = 0.0f;
+		CellLastRadiationIndex[Idx] = 0.0f;
+		CellLastAccumulationDepth_m[Idx] = 0.0f;
+		CellLastMeltDepth_m[Idx] = 0.0f;
+		CellLastMeltFactor[Idx] = 0.0f;
+		CellLastLocalAirTempC[Idx] = 0.0f;
+		CellLastSlopeFiltered[Idx] = 0;
+	}
+
+	CurrentMaxSnowMM = 0.0f;
+}
+
+void UDegreeDaySimulation::PerformDegreeDayStep(float DtSeconds, const FWeatherForcingData& W, int32 DayOfYear, float MeasurementAltitude)
+{
+	const int32 CellCount = CellSnowWaterEquivalentLiters.Num();
+	if (CellCount <= 0 || DtSeconds <= 0.0f)
+	{
+		return;
+	}
+
+	MeasurementAltitudeCm = MeasurementAltitude;
+
+	const float DtDays = DtSeconds / 86400.0f;
+	const float BaseTempC = W.Temperature_K - 273.15f;
+	const float PrecipBase_mm = FMath::Max(0.0f, W.PrecipRate_kgm2s) * DtSeconds;
+	const float OldSnowAlbedo = FMath::Clamp(SnowAlbedo, 0.0f, 1.0f);
+	const float FreshSnowAlbedo = 0.8f;
+
+	for (int32 Idx = 0; Idx < CellCount; ++Idx)
+	{
+		float& SWE = CellSnowWaterEquivalentLiters[Idx];
+		float& SnowAlbedoState = CellSnowAlbedoState[Idx];
+		float& DaysSinceSnow = CellDaysSinceSnowfall[Idx];
+
+		const float AreaSqMeters = CellAreaSqMeters.IsValidIndex(Idx) ? CellAreaSqMeters[Idx] : 0.0f;
+		const float AltitudeCm = CellAltitudeCm.IsValidIndex(Idx) ? (CellAltitudeCm[Idx] - MeasurementAltitude) : 0.0f;
+		const float Inclination = CellInclinationRad.IsValidIndex(Idx) ? CellInclinationRad[Idx] : 0.0f;
+		const float Aspect = CellAspectRad.IsValidIndex(Idx) ? CellAspectRad[Idx] : 0.0f;
+		const float Latitude = CellLatitudeRad.IsValidIndex(Idx) ? CellLatitudeRad[Idx] : 0.0f;
+
+		float LocalTemperatureC = BaseTempC;
+		float LocalPrecip_mm = PrecipBase_mm;
+
+		// Temperature and precipitation lapse rates (Premoze / Blöschl inspired)
+		LocalTemperatureC += (-0.5f * AltitudeCm) / (100.0f * 100.0f);
+		LocalPrecip_mm += (0.5f * AltitudeCm) / (100.0f * 1000.0f);
+		LocalPrecip_mm = FMath::Max(0.0f, LocalPrecip_mm);
+
+		if (CellLastLocalAirTempC.IsValidIndex(Idx))
+		{
+			CellLastLocalAirTempC[Idx] = LocalTemperatureC;
+		}
+
+		float AccumDepth_m = 0.0f;
+		float MeltDepth_m = 0.0f;
+		float MeltFactor = 0.0f;
+		uint8 bSlopeFiltered = 0;
+
+		if (LocalPrecip_mm > 0.0f)
+		{
+			DaysSinceSnow = 0.0f;
+
+			if (LocalTemperatureC > TSnowB)
+			{
+				// Rain event – reduce albedo
+				SnowAlbedoState = OldSnowAlbedo;
+				AccumDepth_m = 0.0f;
+			}
+			else
+			{
+				float SnowRate = 1.0f;
+				const float Denom = (TSnowB - TSnowA);
+				if (FMath::Abs(Denom) > KINDA_SMALL_NUMBER)
+				{
+					SnowRate = FMath::Clamp(1.0f - (LocalTemperatureC - TSnowA) / Denom, 0.0f, 1.0f);
+				}
+				else
+				{
+					SnowRate = (LocalTemperatureC <= TSnowA) ? 1.0f : 0.0f;
+				}
+
+				float SnowGainLiters = LocalPrecip_mm * AreaSqMeters * SnowRate;
+				if (TerrainSlopeDegrees.IsValidIndex(Idx) && TerrainSlopeDegrees[Idx] > SlopeThreshold)
+				{
+					SnowGainLiters = 0.0f;
+					bSlopeFiltered = 1;
+				}
+
+				if (SnowGainLiters > 0.0f)
+				{
+					SWE += SnowGainLiters;
+					SnowAlbedoState = FreshSnowAlbedo;
+					AccumDepth_m = ConvertSWEToDepthMeters(SnowGainLiters, AreaSqMeters);
+				}
+			}
+		}
+
+		// Age albedo after potential snowfall
+		if (SWE > 0.0f)
+		{
+			const float ExpTerm = FMath::Exp(-k_e * FMath::Max(0.0f, DaysSinceSnow));
+			const float TargetAlbedo = OldSnowAlbedo * (1.0f + ExpTerm);
+			SnowAlbedoState = FMath::Clamp(TargetAlbedo, OldSnowAlbedo, FreshSnowAlbedo);
+		}
+		else
+		{
+			SnowAlbedoState = 0.0f;
+		}
+
+		const float RadiationIndex = ComputeSolarRadiationIndex(Inclination, Aspect, Latitude, static_cast<float>(DayOfYear));
+		if (CellLastRadiationIndex.IsValidIndex(Idx))
+		{
+			CellLastRadiationIndex[Idx] = RadiationIndex;
+		}
+
+		if (SWE > 0.0f)
+		{
+			if (LocalTemperatureC > TMeltA)
+			{
+				const float TempDiff = LocalTemperatureC - TMeltA;
+				if (LocalTemperatureC < TMeltB)
+				{
+					MeltFactor = (TempDiff * TempDiff) / FMath::Max(KINDA_SMALL_NUMBER, TMeltB - TMeltA);
+				}
+				else
+				{
+					MeltFactor = TempDiff;
+				}
+
+				const float VegetationDensity = 0.0f;
+				const float k_v = FMath::Exp(-4.0f * VegetationDensity);
+				const float MeltCoefficient = k_m * k_v * RadiationIndex * (1.0f - SnowAlbedoState) * (DtSeconds / 86400.0f) * AreaSqMeters;
+
+				float MeltVolumeLiters = MeltCoefficient * MeltFactor;
+				MeltVolumeLiters = FMath::Min(MeltVolumeLiters, SWE);
+
+				if (MeltVolumeLiters > 0.0f)
+				{
+					SWE -= MeltVolumeLiters;
+					MeltDepth_m = ConvertSWEToDepthMeters(MeltVolumeLiters, AreaSqMeters);
+				}
+			}
+		}
+
+		CellLastAccumulationDepth_m[Idx] = AccumDepth_m;
+		CellLastMeltDepth_m[Idx] = MeltDepth_m;
+		CellLastMeltFactor[Idx] = MeltFactor;
+		CellLastSlopeFiltered[Idx] = bSlopeFiltered;
+
+		DaysSinceSnow += DtDays;
+	}
+
+	UpdateDepthFromSnowWaterEquivalent();
+}
+
+void UDegreeDaySimulation::UpdateDepthFromSnowWaterEquivalent()
+{
+	const int32 CellCount = CellSnowWaterEquivalentLiters.Num();
+	if (CellCount <= 0)
+	{
+		return;
+	}
+
+	if (CellInterpolatedSWE_Liters.Num() != CellCount)
+	{
+		CellInterpolatedSWE_Liters.SetNum(CellCount, EAllowShrinking::No);
+	}
+
+	CurrentMaxSnowMM = 0.0f;
+
+	for (int32 Idx = 0; Idx < CellCount; ++Idx)
+	{
+		const float SWE = CellSnowWaterEquivalentLiters[Idx];
+		const float Curvature = (TerrainCurvature.IsValidIndex(Idx)) ? TerrainCurvature[Idx] : 0.0f;
+		const float InclinationDeg = FMath::RadiansToDegrees(CellInclinationRad.IsValidIndex(Idx) ? CellInclinationRad[Idx] : 0.0f);
+		const float AreaSqMeters = CellAreaSqMeters.IsValidIndex(Idx) ? CellAreaSqMeters[Idx] : 0.0f;
+
+		const float f = (InclinationDeg < 15.0f) ? 0.0f : InclinationDeg / 65.0f;
+		const float a3 = 50.0f;
+
+		float InterpolatedSWE = SWE * (1.0f - f) * (1.0f + a3 * Curvature);
+		InterpolatedSWE = FMath::Max(0.0f, InterpolatedSWE);
+		CellInterpolatedSWE_Liters[Idx] = InterpolatedSWE;
+
+		const float Depth_m = ConvertSWEToDepthMeters(InterpolatedSWE, AreaSqMeters);
+		if (DepthMeters.IsValidIndex(Idx))
+		{
+			DepthMeters[Idx] = Depth_m;
+			CurrentMaxSnowMM = FMath::Max(CurrentMaxSnowMM, Depth_m * 1000.0f);
+		}
+	}
+}
+
+float UDegreeDaySimulation::ComputeSolarRadiationIndex(float Inclination, float Aspect, float Latitude, float DayOfYear) const
+{
+	const float ClampedInclination = FMath::Clamp(Inclination, 0.0f, PI * 0.5f);
+	const float L1 = FMath::Asin(FMath::Cos(ClampedInclination) * FMath::Sin(Latitude) + FMath::Sin(ClampedInclination) * FMath::Cos(Latitude) * FMath::Cos(Aspect));
+	const float D1 = FMath::Cos(ClampedInclination) * FMath::Cos(Latitude) - FMath::Sin(ClampedInclination) * FMath::Sin(Latitude) * FMath::Cos(Aspect);
+	const float L2 = FMath::Atan2(FMath::Sin(ClampedInclination) * FMath::Sin(Aspect), D1);
+
+	const float J = DayOfYear;
+	const float D = 0.007f - 0.4067f * FMath::Cos((J + 10.0f) * 0.0172f);
+	float E = 1.0f - 0.0167f * FMath::Cos((J - 3.0f) * 0.0172f);
+	E = (FMath::Abs(E) < KINDA_SMALL_NUMBER) ? KINDA_SMALL_NUMBER : E;
+
+	const float R0 = 1.95f;
+	const float R1 = 60.0f * R0 / (E * E);
+
+	const float T = SolarFunc2(Latitude, D);
+	const float T0 = -T;
+	const float T1 = T;
+
+	const float T7 = SolarFunc2(L1, D) - L2;
+	const float T6 = -SolarFunc2(L1, D) - L2;
+
+	float T3 = FMath::Min(T7, T1);
+	float T2 = FMath::Max(T6, T0);
+
+	float T4 = T2 * (12.0f / PI);
+	float T5 = T3 * (12.0f / PI);
+	(void)T4;
+	(void)T5;
+
+	if (T3 < T2)
+	{
+		T2 = T3 = 0.0f;
+	}
+
+	float R4 = 0.0f;
+	float T6Wrapped = T6 + PI * 2.0f;
+
+	if (T6Wrapped < T1)
+	{
+		const float T8 = T6Wrapped;
+		const float T9 = T1;
+		R4 = SolarFunc3(L2, L1, T3, T2, R1, D) + SolarFunc3(L2, L1, T9, T8, R1, D);
+	}
+	else
+	{
+		const float T7Wrapped = T7 - PI * 2.0f;
+		if (T7Wrapped > T0)
+		{
+			const float T8 = T0;
+			const float T9 = T0;
+			R4 = SolarFunc3(L2, L1, T3, T2, R1, D) + SolarFunc3(L2, L1, T9, T8, R1, D);
+		}
+		else
+		{
+			R4 = SolarFunc3(L2, L1, T3, T2, R1, D);
+		}
+	}
+
+	const float R3 = SolarFunc3(0.0f, Latitude, T1, T0, R1, D);
+	if (FMath::IsNearlyZero(R3))
+	{
+		return 1.0f;
+	}
+
+	return R4 / R3;
+}
+
+float UDegreeDaySimulation::SolarFunc2(float L, float D) const
+{
+	return FMath::Acos(FMath::Clamp(-FMath::Tan(L) * FMath::Tan(D), -1.0f, 1.0f));
+}
+
+float UDegreeDaySimulation::SolarFunc3(float V, float W, float X, float Y, float R1, float D) const
+{
+	return R1 * (FMath::Sin(D) * FMath::Sin(W) * (X - Y) * (12.0f / PI) +
+		FMath::Cos(D) * FMath::Cos(W) * (FMath::Sin(X + V) - FMath::Sin(Y + V)) * (12.0f / PI));
+}
+
+float UDegreeDaySimulation::ConvertSWEToDepthMeters(float SnowWaterEquivalentLiters, float AreaSquareMeters) const
+{
+	if (AreaSquareMeters <= KINDA_SMALL_NUMBER)
+	{
+		return 0.0f;
+	}
+
+	// 1 liter over 1 m^2 equals 1 mm depth. Convert to meters.
+	const float Depth_mm = SnowWaterEquivalentLiters / AreaSquareMeters;
+	return Depth_mm / 1000.0f;
+}
+
+void UDegreeDaySimulation::Simulate(ASnowSimulationActor* SimulationActor, int32 CurrentSimulationStep, int32 Timesteps,
+	bool SaveSnowMap, bool CaptureDebugInformation, TArray<FDebugCell>& DebugCells)
+{
+	if (!SimulationActor) return;
+
+	// Pull weather forcing for current time
+	FWeatherForcingData W;
+	bool bWeatherValid = false;
+	if (SimulationActor->WeatherProvider)
+	{
+		W = SimulationActor->WeatherProvider->GetWeatherForcing(SimulationActor->CurrentSimulationTime);
+		bWeatherValid = true;
+	}
+	else if (LegacyClimateData.Num() > 0)
+	{
+		const int32 LegacyIndex = FMath::Clamp(CurrentSimulationStep, 0, LegacyClimateData.Num() - 1);
+		const FClimateData& Legacy = LegacyClimateData[LegacyIndex];
+
+		const float TempC = Legacy.Temperature;
+		const float DtSeconds = FMath::Max(SimulationActor->TimeStepSeconds, KINDA_SMALL_NUMBER);
+		const float Precip_mm = FMath::Max(0.0f, Legacy.Precipitation);
+
+		W.Timestamp = SimulationActor->CurrentSimulationTime;
+		W.Temperature_K = TempC + 273.15f;
+		W.PrecipRate_kgm2s = Precip_mm / DtSeconds;
+
+		if (TempC <= TSnowA)
+		{
+			W.SnowFrac_01 = 1.0f;
+		}
+		else if (TempC >= TSnowB)
+		{
+			W.SnowFrac_01 = 0.0f;
+		}
+		else
+		{
+			const float Den = FMath::Max(KINDA_SMALL_NUMBER, TSnowB - TSnowA);
+			W.SnowFrac_01 = FMath::Clamp(1.0f - (TempC - TSnowA) / Den, 0.0f, 1.0f);
+		}
+
+		W.SWdown_Wm2 = 0.0f;
+		W.LWdown_Wm2 = 0.0f;
+		W.Wind_mps = 0.0f;
+		W.RH_01 = 0.6f;
+		bWeatherValid = true;
+	}
+
+	const bool bCollectDiagnostics = bEnableDiagnostics && DiagnosticsEveryNSteps > 0;
+	TArray<FDegreeDayCellDiagnostics> DiagnosticsBuffer;
+	TArray<int32> ValidTrackedIndices;
+
+	// Debug logging
+	if (SimulationStepCounter == 0 && bEnableDiagnostics)
+	{
+		UE_LOG(LogTemp, Display, TEXT("[DegreeDay] Diagnostics enabled: bEnableDiagnostics=%d, EveryNSteps=%d, CellCount=%d"),
+			bEnableDiagnostics, DiagnosticsEveryNSteps, DepthMeters.Num());
+	}
+
+	// Determine which cells to track
+	if (bCollectDiagnostics)
+	{
+		const int32 CellCount = DepthMeters.Num();
+		if (DiagnosticsTrackedCellIndices.Num() == 0)
+		{
+			// Default: track first cell only
+			if (CellCount > 0)
+			{
+				ValidTrackedIndices.Add(0);
+			}
+		}
+		else
+		{
+			// Track specified cells
+			for (int32 RawIndex : DiagnosticsTrackedCellIndices)
+			{
+				if (RawIndex >= 0 && RawIndex < CellCount)
+				{
+					ValidTrackedIndices.AddUnique(RawIndex);
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("[DegreeDay] Invalid cell index %d (CellCount=%d)"), RawIndex, CellCount);
+				}
+			}
+		}
+
+		if (SimulationStepCounter == 0)
+		{
+			UE_LOG(LogTemp, Display, TEXT("[DegreeDay] Tracking %d cells for diagnostics"), ValidTrackedIndices.Num());
+		}
+	}
+
+	// Store pre-step depths for diagnostics
+	TArray<float> DepthsBefore;
+	if (bCollectDiagnostics && ValidTrackedIndices.Num() > 0)
+	{
+		DepthsBefore = DepthMeters;
+	}
+
+	// Step the simulation
+	const float DtSeconds = SimulationActor->TimeStepSeconds;
+	OwningSimulationActor = SimulationActor;
+	if (bWeatherValid)
+	{
+		Step(DtSeconds, W, DepthMeters);
+	}
+	else
+	{
+		// No weather data available. Maintain existing depth but still advance counters.
+	}
+
+	// Collect diagnostics after stepping
+	if (bCollectDiagnostics && ValidTrackedIndices.Num() > 0)
+	{
+		for (int32 CellIdx : ValidTrackedIndices)
+		{
+			FDegreeDayCellDiagnostics Diag;
+			Diag.StepIndex = SimulationStepCounter;
+			Diag.CellIndex = CellIdx;
+			Diag.SimulationTimeSeconds = ElapsedSimulationSeconds;
+			Diag.Timestamp = SimulationActor->CurrentSimulationTime;
+
+			// State
+			Diag.SnowDepthBefore_m = DepthsBefore[CellIdx];
+			Diag.SnowDepth_m = DepthMeters[CellIdx];
+
+			// Forcing
+			Diag.ForcingAirTemperatureK = W.Temperature_K;
+			Diag.ForcingAirTemperatureC = W.Temperature_K - 273.15f;
+			Diag.ForcingPrecipRate_kgm2s = W.PrecipRate_kgm2s;
+			Diag.ForcingPrecipRate_mmph = W.PrecipRate_kgm2s * 3600.0f;
+			Diag.ForcingSnowFrac = W.SnowFrac_01;
+			Diag.ForcingSWdown_Wm2 = W.SWdown_Wm2;
+			Diag.ForcingLWdown_Wm2 = W.LWdown_Wm2;
+			Diag.ForcingWindSpeed_mps = W.Wind_mps;
+			Diag.ForcingRH = W.RH_01;
+
+			// Computed values from per-cell state
+			const float AccumDepth = CellLastAccumulationDepth_m.IsValidIndex(CellIdx) ? CellLastAccumulationDepth_m[CellIdx] : 0.0f;
+			const float MeltDepth = CellLastMeltDepth_m.IsValidIndex(CellIdx) ? CellLastMeltDepth_m[CellIdx] : 0.0f;
+			const float MeltFactor = CellLastMeltFactor.IsValidIndex(CellIdx) ? CellLastMeltFactor[CellIdx] : 0.0f;
+			const bool bSlopeFiltered = CellLastSlopeFiltered.IsValidIndex(CellIdx) ? (CellLastSlopeFiltered[CellIdx] != 0) : false;
+			const float CellSlope = TerrainSlopeDegrees.IsValidIndex(CellIdx) ? TerrainSlopeDegrees[CellIdx] : 0.0f;
+			const float RadiationIdx = CellLastRadiationIndex.IsValidIndex(CellIdx) ? CellLastRadiationIndex[CellIdx] : 0.0f;
+			const float SnowAlbedoState = CellSnowAlbedoState.IsValidIndex(CellIdx) ? CellSnowAlbedoState[CellIdx] : 0.0f;
+
+			Diag.SnowAccumulation_m = AccumDepth;
+			Diag.MeltAmount_m = MeltDepth;
+			Diag.MeltFactor = MeltFactor;
+			Diag.MeltRate_mps = (DtSeconds > 0.0f) ? MeltDepth / DtSeconds : 0.0f;
+			Diag.SnowAlbedo = SnowAlbedoState;
+			Diag.RadiationIndex = RadiationIdx;
+			Diag.bSlopeFiltered = bSlopeFiltered;
+			Diag.CellSlopeDegrees = CellSlope;
+
+			DiagnosticsBuffer.Add(Diag);
+		}
+	}
+
+	// Write diagnostics if needed
+	if (bCollectDiagnostics && DiagnosticsBuffer.Num() > 0)
+	{
+		EnsureDiagnosticsFileInitialized();
+		if (SimulationStepCounter % FMath::Max(1, DiagnosticsEveryNSteps) == 0)
+		{
+			WriteDiagnostics(DiagnosticsBuffer);
+		}
+	}
+
+	// Upload to PF_R16F texture
+	UploadDepthToTexture();
+
+	// Update counters
+	SimulationStepCounter++;
+	ElapsedSimulationSeconds += DtSeconds;
+
+	// TODO: Handle debug cells if needed
+}
+
+void UDegreeDaySimulation::EnsureDiagnosticsFileInitialized()
+{
+	if (bDiagnosticsFileInitialized)
+	{
+		return;
+	}
+
+	// Create diagnostics directory if it doesn't exist
+	FString DiagnosticsDir = FPaths::ProjectDir() / DiagnosticsDirectory;
+	IFileManager::Get().MakeDirectory(*DiagnosticsDir, true);
+
+	// Generate unique filename with timestamp
+	FDateTime Now = FDateTime::Now();
+	FString Timestamp = FString::Printf(TEXT("%04d%02d%02d_%02d%02d%02d"),
+		Now.GetYear(), Now.GetMonth(), Now.GetDay(),
+		Now.GetHour(), Now.GetMinute(), Now.GetSecond());
+
+	DiagnosticsFilePath = DiagnosticsDir / FString::Printf(TEXT("DegreeDayDiagnostics_%s.csv"), *Timestamp);
+
+	bDiagnosticsFileInitialized = true;
+	bDiagnosticsHeaderWritten = false;
+
+	UE_LOG(LogTemp, Display, TEXT("[DegreeDay] Diagnostics will be written to: %s"), *DiagnosticsFilePath);
+}
+
+void UDegreeDaySimulation::WriteDiagnostics(const TArray<FDegreeDayCellDiagnostics>& CellDiagnostics)
+{
+	if (!bDiagnosticsFileInitialized || CellDiagnostics.Num() == 0)
+	{
+		return;
+	}
+
+	FString Output;
+	bool bIsFirstWrite = !bDiagnosticsHeaderWritten;
+
+	// Write header if this is the first write
+	if (bIsFirstWrite)
+	{
+		Output += TEXT("StepIndex,CellIndex,SimulationTimeSeconds,Timestamp,");
+		Output += TEXT("SnowDepthBefore_m,SnowDepth_m,");
+		Output += TEXT("ForcingAirTempK,ForcingAirTempC,ForcingPrecipRate_kgm2s,ForcingSnowFrac,");
+		Output += TEXT("ForcingPrecipRate_mmph,ForcingSWdown_Wm2,ForcingLWdown_Wm2,ForcingWindSpeed_mps,ForcingRH,");
+		Output += TEXT("SnowAccumulation_m,MeltAmount_m,MeltFactor,MeltRate_mps,SnowAlbedo,RadiationIndex,");
+		Output += TEXT("SlopeFiltered,CellSlopeDegrees");
+		Output.AppendChar(TEXT('\n'));
+		bDiagnosticsHeaderWritten = true;
+	}
+
+	// Write data rows
+	for (const FDegreeDayCellDiagnostics& Diag : CellDiagnostics)
+	{
+		Output += FString::Printf(TEXT("%d,%d,%.2f,%s,"),
+			Diag.StepIndex, Diag.CellIndex, Diag.SimulationTimeSeconds,
+			*Diag.Timestamp.ToString(TEXT("%Y-%m-%d %H:%M:%S")));
+
+		Output += FString::Printf(TEXT("%.6f,%.6f,"),
+			Diag.SnowDepthBefore_m, Diag.SnowDepth_m);
+
+		Output += FString::Printf(TEXT("%.2f,%.2f,%.8f,%.4f,"),
+			Diag.ForcingAirTemperatureK, Diag.ForcingAirTemperatureC,
+			Diag.ForcingPrecipRate_kgm2s, Diag.ForcingSnowFrac);
+
+		Output += FString::Printf(TEXT("%.4f,%.2f,%.2f,%.2f,%.4f,"),
+			Diag.ForcingPrecipRate_mmph,
+			Diag.ForcingSWdown_Wm2, Diag.ForcingLWdown_Wm2,
+			Diag.ForcingWindSpeed_mps, Diag.ForcingRH);
+
+		Output += FString::Printf(TEXT("%.6f,%.6f,%.4f,%.8f,%.4f,%.4f,"),
+			Diag.SnowAccumulation_m, Diag.MeltAmount_m,
+			Diag.MeltFactor, Diag.MeltRate_mps,
+			Diag.SnowAlbedo, Diag.RadiationIndex);
+
+		Output += FString::Printf(TEXT("%d,%.2f"),
+			Diag.bSlopeFiltered ? 1 : 0, Diag.CellSlopeDegrees);
+
+		Output.AppendChar(TEXT('\n'));
+	}
+
+	const uint32 WriteFlags = bAppendDiagnostics ? FILEWRITE_Append : FILEWRITE_None;
+	bool bSuccess = FFileHelper::SaveStringToFile(Output, *DiagnosticsFilePath, FFileHelper::EEncodingOptions::AutoDetect, &IFileManager::Get(), WriteFlags);
+
+	if (!bSuccess)
+	{
+		UE_LOG(LogTemp, Error, TEXT("[DegreeDay] Failed to write diagnostics to: %s"), *DiagnosticsFilePath);
+	}
+	else if (bIsFirstWrite)
+	{
+		UE_LOG(LogTemp, Display, TEXT("[DegreeDay] Started diagnostics file: %s (tracking %d cells)"), *DiagnosticsFilePath, CellDiagnostics.Num());
+	}
+}

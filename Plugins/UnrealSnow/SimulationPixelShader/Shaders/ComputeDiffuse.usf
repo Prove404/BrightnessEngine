@@ -1,0 +1,130 @@
+// Diffuse Irradiance Computation Shader
+// Calculates: RTY_Diffuse = max(RTY_Total - RTY_Direct, 0)
+// With optional 3x3 Gaussian blur to suppress GI speckle artifacts
+
+#include "/Engine/Public/Platform.ush"
+
+// Small epsilon to clamp near-zero values
+static const float EPSILON = 0.0001;
+
+// 3x3 Gaussian blur kernel (normalized)
+static const float GaussianKernel[9] = {
+    0.0625, 0.125, 0.0625,  // Top row
+    0.125,  0.25,  0.125,   // Middle row
+    0.0625, 0.125, 0.0625   // Bottom row
+};
+
+// Input textures (R16f single-channel luminance)
+Texture2D<float> RTY_Total;
+Texture2D<float> RTY_Direct;
+
+// Output texture (R16f single-channel)
+RWTexture2D<float> RTY_Diffuse;
+
+// Optional: Temporary texture for blur (same format as output)
+RWTexture2D<float> RTY_DiffuseTemp;
+
+// Shader parameters
+uint2 TextureDimensions;     // Width and height of textures
+uint bEnableBlur;            // 0 = disabled, 1 = enabled
+float CosSolarZenith;        // Cosine of solar zenith angle (nighttime check)
+
+// =============================================================================
+// PASS 1: Compute Diffuse (Total - Direct)
+// =============================================================================
+
+[numthreads(8, 8, 1)]
+void ComputeDiffuseCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    // Early out if thread is outside texture bounds
+    if (ThreadId.x >= TextureDimensions.x || ThreadId.y >= TextureDimensions.y)
+    {
+        return;
+    }
+
+    // Nighttime check: if sun is below horizon, set diffuse to zero
+    // CosSolarZenith <= 0 means sun is below horizon (zenith angle > 90 degrees)
+    if (CosSolarZenith <= 0.0)
+    {
+        // Nighttime: zero out diffuse radiation to prevent shimmering
+        if (bEnableBlur == 1)
+        {
+            RTY_DiffuseTemp[ThreadId.xy] = 0.0;
+        }
+        else
+        {
+            RTY_Diffuse[ThreadId.xy] = 0.0;
+        }
+        return;
+    }
+
+    // Read luminance values from input textures
+    float TotalLuminance = RTY_Total[ThreadId.xy];
+    float DirectLuminance = RTY_Direct[ThreadId.xy];
+
+    // Compute diffuse component
+    // Diffuse = Total - Direct (all indirect lighting: skylight + GI + inter-reflections)
+    float DiffuseLuminance = TotalLuminance - DirectLuminance;
+
+    // Clamp to non-negative with larger epsilon for better numerical stability
+    // Use max(value, 0) first, then add small epsilon only if non-zero
+    DiffuseLuminance = max(DiffuseLuminance, 0.0);
+
+    // For very low light conditions (nighttime), clamp to zero to prevent noise
+    // Lowered threshold to 0.001 to preserve low but valid diffuse values from Lambertian materials
+    if (DiffuseLuminance < 0.001)
+    {
+        DiffuseLuminance = 0.0;
+    }
+
+    // Write to output (or temp buffer if blur is enabled)
+    if (bEnableBlur == 1)
+    {
+        RTY_DiffuseTemp[ThreadId.xy] = DiffuseLuminance;
+    }
+    else
+    {
+        RTY_Diffuse[ThreadId.xy] = DiffuseLuminance;
+    }
+}
+
+// =============================================================================
+// PASS 2: Optional 3x3 Gaussian Blur (Speckle Suppression)
+// =============================================================================
+
+[numthreads(8, 8, 1)]
+void BlurDiffuseCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+    // Early out if thread is outside texture bounds
+    if (ThreadId.x >= TextureDimensions.x || ThreadId.y >= TextureDimensions.y)
+    {
+        return;
+    }
+
+    float BlurredValue = 0.0;
+
+    // Apply 3x3 Gaussian kernel
+    [unroll]
+    for (int dy = -1; dy <= 1; ++dy)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; ++dx)
+        {
+            // Calculate sample position with border clamping
+            int2 SamplePos = int2(ThreadId.xy) + int2(dx, dy);
+            SamplePos.x = clamp(SamplePos.x, 0, int(TextureDimensions.x) - 1);
+            SamplePos.y = clamp(SamplePos.y, 0, int(TextureDimensions.y) - 1);
+
+            // Get kernel weight (row-major indexing)
+            int KernelIndex = (dy + 1) * 3 + (dx + 1);
+            float Weight = GaussianKernel[KernelIndex];
+
+            // Accumulate weighted sample
+            BlurredValue += RTY_DiffuseTemp[SamplePos] * Weight;
+        }
+    }
+
+    // Write blurred result to final output
+    // Re-apply epsilon clamp after blur (blur might create values < epsilon)
+    RTY_Diffuse[ThreadId.xy] = max(BlurredValue, EPSILON);
+}
