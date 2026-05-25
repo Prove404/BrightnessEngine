@@ -28,7 +28,16 @@ PLOT_RESULTS_SCRIPTS = Path(__file__).resolve().parents[3] / "plot-results" / "s
 if str(PLOT_RESULTS_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(PLOT_RESULTS_SCRIPTS))
 
-from plot_map_context import apply_projected_map_context, extent_from_bounds
+try:
+    from plot_map_context import apply_projected_map_context, extent_from_bounds
+except ImportError:
+    def extent_from_bounds(bounds, src_crs=None):
+        left, bottom, right, top = bounds
+        return (left, right, bottom, top)
+
+    def apply_projected_map_context(ax, bounds, src_crs=None):
+        ax.set_xlabel("Easting [m]")
+        ax.set_ylabel("Northing [m]")
 
 try:
     import matplotlib.pyplot as plt

@@ -31,6 +31,10 @@ Open `BrightnessEngine.uproject` from Unreal Engine or regenerate project files 
 
 The remote sensing scripts are kept in `RemoteSensingScripts/` as project utilities, separate from local agent workflow files. They include DEM download/preparation tools, orthophoto texture download helpers, and Sentinel-2 melt-out raster analysis scripts.
 
+## User Manual
+
+See `USER_MANUAL.md` for the seasonal simulation and melt-out mapping workflow.
+
 ## Notes On Assets
 
 This repository contains Unreal binary assets and third-party-derived content. The source code in this repository is licensed under the repository license, while external assets, marketplace content, engine content, Cesium assets, Megascans/Fab content, and other third-party materials remain governed by their respective licenses and terms.
