@@ -9,7 +9,7 @@ This manual intentionally does not cover the hemispherical cavity benchmark, rad
 The reproducible workflow has six stages:
 
 1. Prepare the repository and local tools.
-2. Set up the Unreal scene from the DEM: landscape, georeferencing, SunSky, and simulation actor.
+2. Set up the Unreal scene from the DEM: landscape, materials, RVT/VHM, georeferencing, SunSky, and simulation actor.
 3. Prepare map inputs: AOI, terrain metadata, and optional orthophoto/locator maps.
 4. Run the seasonal snow simulation in Unreal Engine and export `Meltout_*.json` / `Meltout_*.png`.
 5. Generate satellite melt-out reference rasters from Sentinel-2/Landsat.
@@ -104,7 +104,7 @@ Do not use these actor actions for this manual:
 
 ## 4. Set Up The Seasonal Scene
 
-Use this section when recreating the map scene from a DEM or when checking that an existing map is aligned correctly. The simulation assumes that the landscape, georeferencing, SunSky, and `BP_SnowSimulationActor` all describe the same projected terrain grid.
+Use this section when recreating the map scene from a DEM or when checking that an existing map is aligned correctly. The simulation assumes that the landscape, snow/VHM materials, georeferencing, SunSky, and `BP_SnowSimulationActor` all describe the same projected terrain grid.
 
 ### 4.1 Prepare The DEM Heightmap
 
@@ -165,7 +165,91 @@ For an existing map:
 3. Confirm that the landscape material exposes the snow depth/albedo parameters used by the simulation.
 4. Keep the landscape origin stable once terrain/radiation/reference rasters have been generated; changing it invalidates previous georeferenced exports.
 
-### 4.3 Add Georeferencing
+### 4.3 Set Up Landscape Material, Snow Material, RVT, And VHM
+
+The seasonal simulation has two visual/rendering surfaces that must stay aligned:
+
+- The Landscape material writes/reads terrain height and ground appearance.
+- The snow surface material receives the runtime snow depth/albedo textures from `BP_SnowSimulationActor` and displaces/colours the snow surface, normally through a Virtual Heightfield Mesh.
+
+Project assets used by the existing maps include:
+
+- Landscape material examples: `Content/SnowDepth/Materials/M_Landscape_Mod.uasset` and site instances such as `MI_Landscape_Mod_Totalp`, `MI_Landscape_Mod_Finse`, and `MI_Landscape_Mod_Ducan`.
+- Height/RVT support materials: `Content/SnowDepth/Materials/M_Land_Height.uasset`, `Content/SnowDepth/Materials/M_Land_HeightToRVT.uasset`, `Content/M_Land_Height.uasset`, and `Content/M_Land_HeightToRVT.uasset`.
+- Runtime Virtual Textures: `Content/RVT_Land_Height.uasset`, `Content/RVT_Land_Height_MinMax.uasset`, and site variants under `Content/SnowDepth/Textures/RVTs/`.
+- Snow/VHM material examples: `Content/SnowDepth/Materials/M_VHM_Snow.uasset`, `MI_VHM_Snow`, and site instances such as `MI_VHM_Snow_Mod_Totalp`, `MI_VHM_Snow_Mod_Finse`, and `MI_VHM_Snow_Mod_Ducan`.
+
+For the Landscape:
+
+1. Assign the site landscape material instance, for example `MI_Landscape_Mod_Totalp`.
+2. Make sure the landscape material writes or samples the same height/RVT assets used by the snow material.
+3. Assign the Runtime Virtual Texture volume/assets used by the material graph.
+4. Confirm landscape layer info assets are assigned for the site, for example `Snow_LayerInfo` and `GrassDry_LayerInfo` / `Grass_LayerInfo`.
+5. Keep RVT bounds covering the full DEM/landscape footprint.
+
+For the Runtime Virtual Texture setup:
+
+1. Add or validate an RVT Volume covering the complete landscape.
+2. Assign the terrain height RVT, usually `RVT_Land_Height`.
+3. Assign the min/max height RVT when the material instance expects it, usually `RVT_Land_Height_MinMax` or the site-specific variant.
+4. Align the RVT Volume transform with the Landscape bounds, not just the visible AOI.
+5. Build/update virtual texture data if Unreal indicates stale RVT content.
+
+For the Virtual Heightfield Mesh:
+
+1. Add or validate a Virtual Heightfield Mesh actor covering the same area as the Landscape.
+2. Set its Runtime Virtual Texture / height source to the same landscape height RVT.
+3. Assign the snow material instance to the VHM, for example `MI_VHM_Snow_Mod_Totalp`.
+4. Ensure the VHM bounds match the landscape bounds and are not clipped around the AOI.
+5. Keep VHM LOD settings stable during reproducible runs. The actor can force high-detail VHM LOD during radiation captures with `bForceVHMLodForCapture`.
+
+In `BP_SnowSimulationActor`, set the material binding fields:
+
+- `Snow Simulation | Visuals | Material | SnowSurfaceMaterial`: the snow/VHM material instance used for the snow surface.
+- `Snow Simulation | Visuals | Material | TargetVHMSlotIndex`: material slot on the VHM receiving the snow material, normally `0`.
+- `Snow Simulation | Visuals | Material | bOverrideExistingMaterial`: enabled when the actor should replace the VHM material at runtime.
+- `Snow Simulation | Visuals | Material | SnowDisplacementScale`: visual displacement multiplier for snow depth.
+- `Snow Simulation | Visuals | Params`: keep parameter names at their defaults unless the material graph was renamed.
+
+The default parameter names expected by the simulation actor are:
+
+```text
+SnowDepthTex
+SnowAlbedoTex
+SnowOriginMeters
+SnowInvSizePerMeter
+SnowDisplacementScale
+SnowMap
+CellsDimensionX
+CellsDimensionY
+ResolutionX
+ResolutionY
+MaxSnow
+Albedo_WSA
+Albedo_BSA
+SnowRoughness
+SparkleIntensity
+SparkleScale
+SnowAgeDays
+SnowAlbedoMean
+GrainSize_um
+Impurity_ppm
+```
+
+Do not rename these material parameters unless you also update the corresponding `Snow Simulation | Visuals | Params` fields on the actor.
+
+Material validation checklist:
+
+- The VHM snow material receives a changing `SnowDepthTex` after simulation starts.
+- Snow depth displacement appears in the same cells as the debug grid.
+- Snow albedo changes are visible if using an FSM2 or albedo-aware model.
+- The snow surface is not offset relative to the landscape.
+- The VHM does not disappear at camera distance or during radiation captures.
+- The RVT height/min-max values cover the complete landscape.
+
+If no VHM is available, the actor has a landscape material binding fallback, but the seasonal visual workflow is intended to use the VHM path.
+
+### 4.4 Add Georeferencing
 
 Add or validate the Unreal georeferencing setup for the map:
 
@@ -183,7 +267,7 @@ In `BP_SnowSimulationActor`, set:
 
 The default `North = (0, -1, 0)` assumes that negative Unreal Y points north. If the landscape is rotated, update `North` manually and verify with a solar-shadow check.
 
-### 4.4 Add SunSky And Lighting Actors
+### 4.5 Add SunSky And Lighting Actors
 
 The seasonal simulation updates the Sun/Sky state from the simulation time and weather forcing. The level should contain:
 
@@ -202,12 +286,13 @@ Recommended seasonal settings:
 
 Do not use the SkyLight calibration actions for this seasonal reproduction workflow.
 
-### 4.5 Place And Configure `BP_SnowSimulationActor`
+### 4.6 Place And Configure `BP_SnowSimulationActor`
 
 Place one `BP_SnowSimulationActor` in the level and assign or validate:
 
 - The Landscape reference used by the actor.
 - `CellSize`, chosen so simulation cells are an appropriate aggregation of the landscape vertex grid.
+- `SnowSurfaceMaterial`, `TargetVHMSlotIndex`, and material parameter names.
 - `StartTime`, `EndTime`, and weather provider.
 - `SimulationConfiguration`.
 - Radiation capture options only for model variants that use UE radiation fields.
@@ -219,7 +304,7 @@ After placement:
 3. Temporarily enable the debug grid or cell-index overlay if alignment needs visual inspection.
 4. Confirm that cell indexing follows the same orientation assumed by the exported rasters.
 
-### 4.6 Validate Scene Alignment
+### 4.7 Validate Scene Alignment
 
 Before running a full season, export terrain metadata once:
 
@@ -231,6 +316,8 @@ Before running a full season, export terrain metadata once:
 Then run a short simulation or debug export and check that:
 
 - Melt-out / terrain rasters are not transposed.
+- Snow displacement and albedo update on the VHM during a test step.
+- The VHM snow surface, landscape material, and debug grid occupy the same cells.
 - North in the map matches north in the satellite reference.
 - Sun movement is plausible for the site latitude, longitude, date, and time.
 - The model output and reference raster overlap when inspected with `inspect_rasters.py`.
@@ -474,6 +561,9 @@ Before accepting a reproduced run, verify:
 
 - The Unreal map tag in `Meltout_*.json` matches the map directory.
 - The landscape scale, `CellSize`, and `CellSizeMeters` metadata agree.
+- The landscape material, RVT assets, VHM actor, and snow material cover the same terrain extent.
+- The actor `SnowSurfaceMaterial` points to the intended VHM snow material instance.
+- Runtime snow textures drive the expected material parameters (`SnowDepthTex`, `SnowAlbedoTex`, and alignment parameters).
 - The actor `Latitude`, `Longitude`, `North`, and GeoReferencing CRS match the DEM.
 - SunSky follows the expected sun path for the selected site and date range.
 - `StartTime` and `EndTime` in Unreal match the Earth Engine `--start_date` and `--end_date`.
@@ -510,6 +600,15 @@ If maps appear shifted or rotated, inspect the UE metadata with `inspect_rasters
 - `PixelLayoutTransform`.
 - landscape rotation and actor `North` vector.
 
+If snow does not appear on the terrain:
+
+- confirm that a VHM actor exists and overlaps the Landscape,
+- confirm that the VHM uses the expected snow material instance,
+- confirm that `SnowSurfaceMaterial` and `TargetVHMSlotIndex` are set on `BP_SnowSimulationActor`,
+- confirm that `bOverrideExistingMaterial` is enabled if the actor should bind the material at runtime,
+- confirm that the material parameter names match the actor defaults,
+- confirm that RVT height/min-max assets are assigned and cover the landscape.
+
 If `plot_all_meltout_maps.py` reports zero paired cells, try:
 
 - lowering `--min-obs-count`,
@@ -526,6 +625,8 @@ For each final run, save these values in your notes:
 - Map name and map tag.
 - DEM source, CRS, pixel size, bounds, and vertical datum.
 - Landscape location, rotation, scale, and simulation `CellSize`.
+- Landscape material instance, RVT assets, VHM actor/material, and snow material instance.
+- Snow visual parameters: `SnowDisplacementScale`, albedo controls, and any non-default material parameter names.
 - GeoReferencing projected origin and actor latitude/longitude/north vector.
 - SunSky time offset, daylight-saving setting, and production lighting intensity mode.
 - Simulation model and radiation scheme.
