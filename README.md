@@ -10,7 +10,7 @@ BrightnessEngine is an Unreal Engine project for snow, terrain, and radiation si
 - `Config/` contains Unreal Engine project configuration.
 - `Content/` contains Unreal maps, materials, blueprints, textures, and other binary project assets.
 - `ForcingData/` contains example and prepared meteorological forcing files.
-- `.agents/skills/` contains local workflow notes and automation instructions used during development.
+- `RemoteSensingScripts/` contains remote sensing and DEM processing scripts used for data preparation and melt-out raster analysis.
 
 ## Requirements
 
@@ -26,6 +26,10 @@ git lfs pull
 ```
 
 Open `BrightnessEngine.uproject` from Unreal Engine or regenerate project files if required by your local engine installation.
+
+## Remote Sensing Scripts
+
+The remote sensing scripts are kept in `RemoteSensingScripts/` as project utilities, separate from local agent workflow files. They include DEM download/preparation tools, orthophoto texture download helpers, and Sentinel-2 melt-out raster analysis scripts.
 
 ## Notes On Assets
 

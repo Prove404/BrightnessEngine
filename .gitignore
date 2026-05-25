@@ -60,6 +60,7 @@ CryoGridCommunity_source-master/
 nul
 
 # Local tooling and recovery artifacts
+.agents/
 .codex/
 .claude/
 .tmp/
@@ -68,4 +69,3 @@ nul
 __pycache__/
 *.backup
 StepSimulation*
-.agents/skills/run-horayzon/third_party/hmm/
