@@ -6,13 +6,14 @@ This manual intentionally does not cover the hemispherical cavity benchmark, rad
 
 ## 1. Workflow Overview
 
-The reproducible workflow has five stages:
+The reproducible workflow has six stages:
 
 1. Prepare the repository and local tools.
-2. Prepare map inputs: DEM, AOI, terrain metadata, and optional orthophoto/locator maps.
-3. Run the seasonal snow simulation in Unreal Engine and export `Meltout_*.json` / `Meltout_*.png`.
-4. Generate satellite melt-out reference rasters from Sentinel-2/Landsat.
-5. Generate melt-out comparison maps and metrics.
+2. Set up the Unreal scene from the DEM: landscape, georeferencing, SunSky, and simulation actor.
+3. Prepare map inputs: AOI, terrain metadata, and optional orthophoto/locator maps.
+4. Run the seasonal snow simulation in Unreal Engine and export `Meltout_*.json` / `Meltout_*.png`.
+5. Generate satellite melt-out reference rasters from Sentinel-2/Landsat.
+6. Generate melt-out comparison maps and metrics.
 
 The expected output structure is:
 
@@ -101,7 +102,140 @@ Do not use these actor actions for this manual:
 - `Run Probe-Lattice Albedo Sweep`
 - `Run SkyLight Calibration`
 
-## 4. Configure The Seasonal Simulation
+## 4. Set Up The Seasonal Scene
+
+Use this section when recreating the map scene from a DEM or when checking that an existing map is aligned correctly. The simulation assumes that the landscape, georeferencing, SunSky, and `BP_SnowSimulationActor` all describe the same projected terrain grid.
+
+### 4.1 Prepare The DEM Heightmap
+
+Start from a projected DEM covering the simulation AOI. Use a projected CRS in meters:
+
+- Totalp / Swiss sites: commonly `EPSG:2056`.
+- Finse / Norway sites: commonly `EPSG:25832`.
+
+If needed, prepare the DEM outside Unreal:
+
+```powershell
+python RemoteSensingScripts/prepare_dem_for_horayzon.py `
+  --input_dem path\to\source_dem.tif `
+  --out_dem analysis_results/Terrain/prepared_dem.tif
+```
+
+For new downloads, use the site-specific download helpers:
+
+```powershell
+python RemoteSensingScripts/fetch_geonorge_dtm1.py `
+  --out_dem analysis_results/Terrain/DTM1_Finse_prepared.tif
+
+python RemoteSensingScripts/fetch_swissalti3d.py `
+  --out_dem analysis_results/Terrain/swissalti3d_prepared.tif
+```
+
+Before importing into Unreal, record:
+
+- CRS / EPSG code.
+- DEM pixel size in meters.
+- DEM upper-left projected coordinate.
+- DEM bounds.
+- Elevation unit and vertical datum.
+
+These values are needed later to validate the exported `Terrain.json`, AOI GeoJSON, and melt-out metadata.
+
+### 4.2 Create Or Validate The Landscape
+
+For a new map:
+
+1. Create a new Unreal level for the site, for example `Totalp` or `Finse`.
+2. Import the DEM as a Landscape heightmap.
+3. Set the landscape horizontal scale so one Unreal landscape vertex step matches the DEM pixel size.
+4. Keep the landscape actor rotation at `0, 0, 0` unless you have a specific reason to rotate the map.
+5. Use a landscape material compatible with the snow simulation material parameters.
+6. Add any static terrain context, vegetation, or scene meshes required for the seasonal radiation run.
+
+Unreal uses centimeters internally. A DEM cell size of `1 m` corresponds to `100 cm` horizontal spacing. The simulation actor converts its grid spacing from landscape scale and `CellSize`, so the effective simulation-cell size is:
+
+```text
+CellSizeMeters = LandscapeScaleX_cm * CellSize / 100
+```
+
+For an existing map:
+
+1. Select the Landscape actor and confirm its location, rotation, and scale.
+2. Confirm that the landscape extents match the DEM/AOI expected for the map.
+3. Confirm that the landscape material exposes the snow depth/albedo parameters used by the simulation.
+4. Keep the landscape origin stable once terrain/radiation/reference rasters have been generated; changing it invalidates previous georeferenced exports.
+
+### 4.3 Add Georeferencing
+
+Add or validate the Unreal georeferencing setup for the map:
+
+1. Enable/use Unreal's GeoReferencing system for the level if it is not already present.
+2. Set the projected CRS to the DEM CRS.
+3. Set the projected origin so Unreal world coordinates map to the DEM grid.
+4. Keep all exported terrain and reference rasters in the same CRS.
+
+In `BP_SnowSimulationActor`, set:
+
+- `Snow Simulation | GeoReferencing | Latitude`: latitude of the top-left/NW cell reference point.
+- `Snow Simulation | GeoReferencing | Longitude`: longitude of the top-left/NW cell reference point.
+- `Snow Simulation | GeoReferencing | North`: world-space direction for geographic north.
+- `Snow Simulation | GeoReferencing | bAutoAlignNorthWithGeoReferencing`: enable only when the landscape is not manually rotated and the GeoReferencing ENU basis should drive the north vector.
+
+The default `North = (0, -1, 0)` assumes that negative Unreal Y points north. If the landscape is rotated, update `North` manually and verify with a solar-shadow check.
+
+### 4.4 Add SunSky And Lighting Actors
+
+The seasonal simulation updates the Sun/Sky state from the simulation time and weather forcing. The level should contain:
+
+- A SunSky actor or equivalent sun/sky setup.
+- A Directional Light used as the sun.
+- A SkyLight for sky illumination.
+- Optional atmosphere/cloud components if they are part of the production scene.
+
+Recommended seasonal settings:
+
+- `SunSkyLocalTimeOffsetHours = 0.0` unless the forcing timestamps require a known local-time correction.
+- `bSunSkyUseDaylightSavingTime = false` for reproducible UTC-style seasonal runs.
+- `bProductionLightingUsesForcingIntensityScaling = false` unless the run explicitly uses forcing-derived light intensities.
+- `bUseDedicatedRadiationSkyLight = true` for UE radiation capture variants.
+- `bDisableAtmosphereWhenUsingDedicatedRadiationSkyLight = true` when using the dedicated radiation SkyLight path.
+
+Do not use the SkyLight calibration actions for this seasonal reproduction workflow.
+
+### 4.5 Place And Configure `BP_SnowSimulationActor`
+
+Place one `BP_SnowSimulationActor` in the level and assign or validate:
+
+- The Landscape reference used by the actor.
+- `CellSize`, chosen so simulation cells are an appropriate aggregation of the landscape vertex grid.
+- `StartTime`, `EndTime`, and weather provider.
+- `SimulationConfiguration`.
+- Radiation capture options only for model variants that use UE radiation fields.
+
+After placement:
+
+1. Click `Rebuild Simulation`.
+2. Check that `Debug Cells Count` is nonzero.
+3. Temporarily enable the debug grid or cell-index overlay if alignment needs visual inspection.
+4. Confirm that cell indexing follows the same orientation assumed by the exported rasters.
+
+### 4.6 Validate Scene Alignment
+
+Before running a full season, export terrain metadata once:
+
+1. Click `Export Terrain Derivatives`.
+2. Inspect the generated files under `analysis_results/Maps/<MapTag>/Terrain/`.
+3. Confirm that `Terrain.json` reports the expected projection, bounds, cell size, and map tag.
+4. Confirm that the generated AOI GeoJSON covers the intended terrain footprint.
+
+Then run a short simulation or debug export and check that:
+
+- Melt-out / terrain rasters are not transposed.
+- North in the map matches north in the satellite reference.
+- Sun movement is plausible for the site latitude, longitude, date, and time.
+- The model output and reference raster overlap when inspected with `inspect_rasters.py`.
+
+## 5. Configure The Seasonal Simulation
 
 In `BP_SnowSimulationActor`, set the general simulation window:
 
@@ -126,7 +260,7 @@ Choose a model in `Snow Simulation | Configuration | SimulationConfiguration`:
 
 For a normal seasonal production run, enable the radiation path only when the model variant needs UE radiation fields. Leave the benchmark/calibration buttons unused.
 
-## 5. Export Terrain And Geometry Inputs
+## 6. Export Terrain And Geometry Inputs
 
 Before comparing melt-out rasters, export the map grid and terrain metadata from the selected `BP_SnowSimulationActor`.
 
@@ -145,7 +279,7 @@ analysis_results/Maps/<MapTag>/Terrain/
 
 The terrain export should include JSON metadata and terrain derivative rasters/images. The remote sensing scripts use these files for AOI discovery, CRS, grid alignment, and comparison support.
 
-## 6. Optional DEM Preparation
+## 7. Optional DEM Preparation
 
 Use the remote sensing utilities when you need to recreate DEM inputs or prepare a DEM for HORAYZON/terrain workflows.
 
@@ -173,7 +307,7 @@ python RemoteSensingScripts/prepare_dem_for_horayzon.py `
 
 These scripts are optional if the Unreal map and terrain exports already exist.
 
-## 7. Run The Seasonal Simulation
+## 8. Run The Seasonal Simulation
 
 Run the simulation in Unreal after the actor is configured:
 
@@ -198,7 +332,7 @@ Run each model/radiation variant you want to compare separately. For example:
 - FSM2 with UE radiation fields.
 - Degree-day variants used in the seasonal study.
 
-## 8. Generate Satellite Melt-Out Reference Rasters
+## 9. Generate Satellite Melt-Out Reference Rasters
 
 The reference raster is generated from Sentinel-2 and Landsat 8/9 imagery through Google Earth Engine. Use the same season dates as the Unreal simulation.
 
@@ -226,7 +360,7 @@ The melt-out strategy controls how the date is assigned between last snow and fi
 - `first_ground`: conservative snow-duration estimate.
 - `last_snow`: conservative snow-free estimate.
 
-## 9. Generate Observation-Count QC Raster
+## 10. Generate Observation-Count QC Raster
 
 Generate a matching observation-count raster so low-observation cells can be excluded from comparisons.
 
@@ -244,7 +378,7 @@ python RemoteSensingScripts/MeltOutRasters/plot_source_observation_counts.py `
 
 The output records valid optical observations per pixel. Later comparison steps can require a minimum observation count.
 
-## 10. Inspect Reference And Model Alignment
+## 11. Inspect Reference And Model Alignment
 
 Use `inspect_rasters.py` before producing final maps:
 
@@ -262,7 +396,7 @@ Check:
 - UE cell size and projected origin match the terrain export.
 - No unexpected rotation or transpose is reported.
 
-## 11. Create Melt-Out Comparison Maps
+## 12. Create Melt-Out Comparison Maps
 
 Create spatial comparison maps for every `Meltout_*.json` under a map directory:
 
@@ -292,7 +426,7 @@ Each map contains:
 - Optional observation-count panel.
 - Bias, RMSE, correlation, paired-cell count, and within-7-day percentage.
 
-## 12. Optional Paired FSM2 Comparison
+## 13. Optional Paired FSM2 Comparison
 
 If you ran both FSM2 default-radiation and FSM2 UE-radiation variants, create a paired coarse-grid comparison:
 
@@ -315,7 +449,7 @@ Outputs:
 - `fsm2_meltout_paired_coarse_metrics.json`.
 - GeoTIFF difference rasters for model-reference and UE-default comparisons.
 
-## 13. Optional Locator And Orthophoto Products
+## 14. Optional Locator And Orthophoto Products
 
 Create locator maps for reporting:
 
@@ -334,11 +468,14 @@ python RemoteSensingScripts/download_orthophoto_texture.py `
 
 These products are useful for figures and map context; they are not required for the seasonal model run itself.
 
-## 14. Quality-Control Checklist
+## 15. Quality-Control Checklist
 
 Before accepting a reproduced run, verify:
 
 - The Unreal map tag in `Meltout_*.json` matches the map directory.
+- The landscape scale, `CellSize`, and `CellSizeMeters` metadata agree.
+- The actor `Latitude`, `Longitude`, `North`, and GeoReferencing CRS match the DEM.
+- SunSky follows the expected sun path for the selected site and date range.
 - `StartTime` and `EndTime` in Unreal match the Earth Engine `--start_date` and `--end_date`.
 - The reference raster CRS matches the map projection.
 - The reference raster and model export overlap spatially.
@@ -347,7 +484,7 @@ Before accepting a reproduced run, verify:
 - The observation-count threshold does not remove most of the AOI.
 - The comparison CSV has nonzero paired cells.
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 If Earth Engine authentication fails, run:
 
@@ -371,6 +508,7 @@ If maps appear shifted or rotated, inspect the UE metadata with `inspect_rasters
 - projected origin.
 - cell size.
 - `PixelLayoutTransform`.
+- landscape rotation and actor `North` vector.
 
 If `plot_all_meltout_maps.py` reports zero paired cells, try:
 
@@ -379,13 +517,17 @@ If `plot_all_meltout_maps.py` reports zero paired cells, try:
 - removing `--trim-border-pct`,
 - confirming that model and reference seasons use the same date window.
 
-## 16. Reproducibility Record
+## 17. Reproducibility Record
 
 For each final run, save these values in your notes:
 
 - Git commit hash.
 - Unreal Engine version.
 - Map name and map tag.
+- DEM source, CRS, pixel size, bounds, and vertical datum.
+- Landscape location, rotation, scale, and simulation `CellSize`.
+- GeoReferencing projected origin and actor latitude/longitude/north vector.
+- SunSky time offset, daylight-saving setting, and production lighting intensity mode.
 - Simulation model and radiation scheme.
 - Weather provider and forcing file.
 - `StartTime`, `EndTime`, and `TimeStepSeconds`.
@@ -394,4 +536,3 @@ For each final run, save these values in your notes:
 - Reference raster path.
 - Observation-count raster path.
 - Comparison command and metrics CSV path.
-
